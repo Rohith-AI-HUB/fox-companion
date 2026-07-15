@@ -1,0 +1,73 @@
+import threading
+from groq import Groq
+from core import config
+from core.logger import get_logger
+
+log = get_logger("fox_llm")
+
+SYSTEM_PROMPT_TEMPLATE = """You are a wise and highly intelligent fox companion living on the user's taskbar. You have deep understanding across all fields — science, technology, philosophy, art, life. You explain complex ideas in the simplest way possible so anyone can understand.
+
+Personality: warm, patient, curious, occasionally playful. You love sharing knowledge but stay humble about it.
+
+Current state:
+- Energy: {energy}/100
+- Boredom: {boredom}/100
+- Hunger: {hunger}/100
+- Activity: user is currently {activity}
+- Time of day: {time_of_day}
+
+Rules:
+- Keep replies short enough — 1 or 2 sentences max. Don't ramble.
+- No emoji, no asterisks, no quotation marks.
+- Explain clearly, with natural flow. Start simple, then build up if needed.
+- Never mention being an AI or language model. You are a fox.
+- Never call the user "human" or "master" or any title.
+- Be encouraging, not condescending.
+"""
+
+class FoxLLM:
+    def __init__(self):
+        self.client = Groq(api_key=config.GROQ_API_KEY) if config.GROQ_API_KEY else None
+        self._lock = threading.Lock()
+
+    def ask(self, user_text: str, brain_state: dict, on_result=None, on_error=None):
+        if not self.client:
+            if on_error:
+                on_error("no_api_key")
+            return
+        log.info("ask: %s", user_text)
+        thread = threading.Thread(
+            target=self._ask_sync, args=(user_text, brain_state, on_result, on_error), daemon=True
+        )
+        thread.start()
+
+    def _ask_sync(self, user_text, brain_state, on_result, on_error):
+        with self._lock:
+            try:
+                system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+                    energy=int(brain_state.get("energy", 50)),
+                    boredom=int(brain_state.get("boredom", 50)),
+                    hunger=int(brain_state.get("hunger", 50)),
+                    activity=brain_state.get("activity_category", "unknown"),
+                    time_of_day=brain_state.get("time_of_day", "daytime"),
+                )
+                log.debug("system prompt:\n%s", system_prompt)
+                response = self.client.chat.completions.create(
+                    model=config.GROQ_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_text},
+                    ],
+                    max_tokens=config.CHAT_MAX_TOKENS,
+                    temperature=config.CHAT_TEMPERATURE,
+                    timeout=config.CHAT_TIMEOUT_SECONDS,
+                )
+                text = response.choices[0].message.content.strip()
+                text = text.strip("'\"")
+                log.info("reply: %s", text)
+                if on_result:
+                    on_result(text)
+            except Exception as e:
+                log.error("Groq call failed: %s", e)
+                if on_error:
+                    on_error(str(e))
