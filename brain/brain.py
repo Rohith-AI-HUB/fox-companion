@@ -5,11 +5,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import hashlib
+import logging
 from fastembed import TextEmbedding
 import chromadb
 from chromadb.config import Settings
 from groq import Groq
 from dotenv import load_dotenv
+from core.logger import get_logger
+
+log = get_logger("memory")
 
 class FoxBrain:
     def __init__(self, user_id: str = "default", vault_path: str = "brain/vault"):
@@ -32,7 +36,7 @@ class FoxBrain:
         if groq_api_key:
             self.groq_client = Groq(api_key=groq_api_key)
         else:
-            print("Warning: GROQ_API_KEY not found in environment variables")
+            log.warning("GROQ_API_KEY not found in environment variables — memory entity extraction and contradiction detection disabled")
             self.groq_client = None
         
         # Initialize Mem0 with local FastEmbed
@@ -57,53 +61,63 @@ class FoxBrain:
                 metadata={"hnsw:space": "cosine"}
             )
             self.memory = None  # We'll use Chroma directly instead of Mem0
-            print("[OK] Initialized ChromaDB with FastEmbed")
+            log.info("Initialized ChromaDB with FastEmbed vector store")
         except Exception as e:
-            print(f"Warning: Could not initialize ChromaDB: {e}")
-            print("Falling back to a simple memory implementation without embeddings")
+            log.warning("Could not initialize ChromaDB: %s. Falling back to non-semantic memory (keyword search only)", e)
             self.chroma_client = None
             self.collection = None
             self.memory = None
         
     def _init_sqlite_fts(self):
-        """Initialize SQLite FTS5 for exact-match keyword search and temporal validity."""
+        """Initialize SQLite FTS5 for exact-match keyword search and temporal validity.
+
+        ``check_same_thread=False`` permits the capture/retrieve worker threads
+        created by the async pipeline (Phase 2 Step 2.2) to share a single
+        connection safely for read operations. All writes still funnel through
+        the connection-level lock serialised by CPython's GIL; for true
+        concurrent insertions, replace this with a dedicated DB-worker queue.
+        """
+        import threading
         self.db_path = self.vault_path / "keyword_search.db"
-        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
+        self.conn.row_factory = sqlite3.Row
         self.cursor = self.conn.cursor()
-        
-        # Create main facts table with temporal validity
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS facts (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                metadata TEXT,
-                user_id TEXT NOT NULL,
-                entity_key TEXT,
-                valid_from TIMESTAMP NOT NULL,
-                valid_to TIMESTAMP NULL,
-                superseded_by TEXT NULL,
-                created_at TIMESTAMP NOT NULL
-            )
-        """)
-        
-        # Create FTS5 virtual table for full-text search
-        self.cursor.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts 
-            USING fts5(id, content, metadata, user_id, entity_key)
-        """)
-        
-        # Create indexes for temporal queries
-        self.cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_entity_key 
-            ON facts(entity_key, valid_to)
-        """)
-        
-        self.cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_valid 
-            ON facts(user_id, valid_to)
-        """)
-        
-        self.conn.commit()
+        self._db_lock = threading.Lock()
+
+        with self._db_lock:
+            # Create main facts table with temporal validity
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS facts (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    user_id TEXT NOT NULL,
+                    entity_key TEXT,
+                    valid_from TIMESTAMP NOT NULL,
+                    valid_to TIMESTAMP NULL,
+                    superseded_by TEXT NULL,
+                    created_at TIMESTAMP NOT NULL
+                )
+            """)
+
+            # Create FTS5 virtual table for full-text search
+            self.cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts 
+                USING fts5(id, content, metadata, user_id, entity_key)
+            """)
+
+            # Create indexes for temporal queries
+            self.cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_entity_key 
+                ON facts(entity_key, valid_to)
+            """)
+
+            self.cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_valid 
+                ON facts(user_id, valid_to)
+            """)
+
+            self.conn.commit()
         
     def _generate_slug(self, text: str) -> str:
         """Generate URL-friendly slug from text."""
@@ -144,8 +158,7 @@ Respond with only the key, nothing else."""
             return entity_key if entity_key else "user.unknown"
             
         except Exception as e:
-            print(f"Warning: Entity extraction failed: {e}")
-            # Fallback to simple extraction
+            log.warning("Entity extraction via Groq failed: %s — falling back to simple keyword extraction", e)
             words = fact_text.lower().split()
             if len(words) >= 2:
                 return f"user.{'_'.join(words[:2])}"
@@ -212,7 +225,7 @@ Respond with only the key, nothing else."""
                     )
                     fact['metadata']['tags'].append('vector_indexed')
             except Exception as e:
-                print(f"Warning: Could not add to vector store: {e}")
+                log.warning("Could not index fact into vector store: %s", e)
         
         # Insert into SQLite with temporal validity
         self._insert_fact_with_temporal(fact, user_id, current_time)
@@ -262,17 +275,19 @@ Respond with only the key, nothing else."""
             
     def _get_current_facts_by_entity(self, entity_key: str, user_id: str) -> List[Dict[str, Any]]:
         """Get currently valid facts for a given entity_key."""
-        self.cursor.execute(
-            """
-            SELECT id, content, metadata, entity_key, valid_from
-            FROM facts 
-            WHERE entity_key = ? AND user_id = ? AND valid_to IS NULL
-            """,
-            (entity_key, user_id)
-        )
-        
+        with self._db_lock:
+            self.cursor.execute(
+                """
+                SELECT id, content, metadata, entity_key, valid_from
+                FROM facts 
+                WHERE entity_key = ? AND user_id = ? AND valid_to IS NULL
+                """,
+                (entity_key, user_id)
+            )
+            rows = self.cursor.fetchall()
+
         facts = []
-        for row in self.cursor.fetchall():
+        for row in rows:
             facts.append({
                 'id': row[0],
                 'content': row[1],
@@ -280,7 +295,6 @@ Respond with only the key, nothing else."""
                 'entity_key': row[3],
                 'valid_from': row[4]
             })
-            
         return facts
     
     def _detect_contradiction(self, old_fact: Dict[str, Any], new_fact: Dict[str, Any], entity_key: str) -> str:
@@ -312,46 +326,45 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
             return result.get('relation', 'unrelated')
             
         except Exception as e:
-            print(f"Warning: Contradiction detection failed: {e}")
+            log.warning("Groq contradiction detection failed: %s — defaulting to update relation", e)
             return "update"  # Default to update on failure
     
     def _apply_temporal_resolution(self, old_fact: Dict[str, Any], new_fact: Dict[str, Any], relation: str, user_id: str):
         """Apply temporal validity resolution based on relation type."""
         current_time = datetime.now()
-        
+
         if relation in ['update', 'contradiction']:
-            # Set old fact's valid_to and superseded_by
-            self.cursor.execute(
-                """
-                UPDATE facts 
-                SET valid_to = ?, superseded_by = ?
-                WHERE id = ?
-                """,
-                (current_time.isoformat(), new_fact['id'], old_fact['id'])
-            )
-            self.conn.commit()
-            
-            # Log to conflicts.md
+            with self._db_lock:
+                self.cursor.execute(
+                    """
+                    UPDATE facts 
+                    SET valid_to = ?, superseded_by = ?
+                    WHERE id = ?
+                    """,
+                    (current_time.isoformat(), new_fact['id'], old_fact['id'])
+                )
+                self.conn.commit()
             self._log_conflict(old_fact, new_fact, relation, user_id)
-    
+
     def _insert_fact_with_temporal(self, fact: Dict[str, Any], user_id: str, current_time: datetime):
         """Insert fact into SQLite with temporal validity fields."""
-        self.cursor.execute(
-            """
-            INSERT INTO facts (id, content, metadata, user_id, entity_key, valid_from, valid_to, superseded_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
-            """,
-            (
-                fact['id'],
-                fact.get('content', ''),
-                json.dumps(fact.get('metadata', {})),
-                user_id,
-                fact.get('entity_key', 'user.unknown'),
-                current_time.isoformat(),
-                current_time.isoformat()
+        with self._db_lock:
+            self.cursor.execute(
+                """
+                INSERT INTO facts (id, content, metadata, user_id, entity_key, valid_from, valid_to, superseded_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                """,
+                (
+                    fact['id'],
+                    fact.get('content', ''),
+                    json.dumps(fact.get('metadata', {})),
+                    user_id,
+                    fact.get('entity_key', 'user.unknown'),
+                    current_time.isoformat(),
+                    current_time.isoformat()
+                )
             )
-        )
-        self.conn.commit()
+            self.conn.commit()
     
     def _log_conflict(self, old_fact: Dict[str, Any], new_fact: Dict[str, Any], relation: str, user_id: str):
         """Log conflict resolution to conflicts.md."""
@@ -376,25 +389,24 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
     
     def _add_to_fts(self, fact: Dict[str, Any], user_id: str):
         """Add a fact to SQLite FTS5 for keyword search."""
-        # Check if fact already exists to avoid duplicates
-        self.cursor.execute(
-            "SELECT id FROM facts_fts WHERE id = ?",
-            (fact['id'],)
-        )
-        if self.cursor.fetchone():
-            return  # Already exists, skip
-            
-        self.cursor.execute(
-            "INSERT INTO facts_fts (id, content, metadata, user_id, entity_key) VALUES (?, ?, ?, ?, ?)",
-            (
-                fact['id'],
-                fact.get('content', ''),
-                json.dumps(fact.get('metadata', {})),
-                user_id,
-                fact.get('entity_key', 'user.unknown')
+        with self._db_lock:
+            self.cursor.execute(
+                "SELECT id FROM facts_fts WHERE id = ?",
+                (fact['id'],)
             )
-        )
-        self.conn.commit()
+            if self.cursor.fetchone():
+                return  # Already exists, skip
+            self.cursor.execute(
+                "INSERT INTO facts_fts (id, content, metadata, user_id, entity_key) VALUES (?, ?, ?, ?, ?)",
+                (
+                    fact['id'],
+                    fact.get('content', ''),
+                    json.dumps(fact.get('metadata', {})),
+                    user_id,
+                    fact.get('entity_key', 'user.unknown')
+                )
+            )
+            self.conn.commit()
         
     def retrieve(self, query: str, user_id: Optional[str] = None, top_k: int = 5, include_historical: bool = False) -> Dict[str, List[Dict[str, Any]]]:
         """
@@ -445,7 +457,7 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
                                     'score': results['distances'][0][i] if results['distances'] else None
                                 })
             except Exception as e:
-                print(f"Warning: Semantic search failed: {e}")
+                log.warning("ChromaDB semantic search failed: %s", e)
                 semantic_results = []
         
         # Exact-match search via SQLite FTS with temporal filtering
@@ -462,88 +474,95 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
     
     def _get_valid_fact_ids(self, user_id: str, include_historical: bool = False) -> set:
         """Get set of valid fact IDs based on temporal validity."""
-        if include_historical:
-            # Return all fact IDs
-            self.cursor.execute(
-                "SELECT id FROM facts WHERE user_id = ?",
-                (user_id,)
-            )
-        else:
-            # Return only currently valid facts
-            self.cursor.execute(
-                "SELECT id FROM facts WHERE user_id = ? AND valid_to IS NULL",
-                (user_id,)
-            )
+        with self._db_lock:
+            if include_historical:
+                self.cursor.execute(
+                    "SELECT id FROM facts WHERE user_id = ?",
+                    (user_id,)
+                )
+            else:
+                self.cursor.execute(
+                    "SELECT id FROM facts WHERE user_id = ? AND valid_to IS NULL",
+                    (user_id,)
+                )
+            rows = self.cursor.fetchall()
+        return {row[0] for row in rows}
         
-        return {row[0] for row in self.cursor.fetchall()}
-        
+    @staticmethod
+    def _escape_fts_query(query: str) -> str:
+        """Escape a string for safe use in an FTS5 MATCH expression.
+
+        FTS5 special characters: + - " * ( ) : { } ^ ! ~ & | < >
+        We wrap the whole query in double quotes (phrase search) and escape
+        embedded double quotes. This disables all query operators and treats
+        the input as a literal phrase, which is the safe behaviour for a
+        keyword-search box driven by untrusted user input.
+        """
+        escaped = query.replace('"', '""')
+        return '"' + escaped + '"'
+
     def _fts_search(self, query: str, user_id: str, limit: int, include_historical: bool = False) -> List[Dict[str, Any]]:
-        """Perform exact-match search using SQLite FTS5 with temporal filtering."""
+        """Perform exact-match search using SQLite FTS5 with temporal filtering.
+
+        All user-supplied values are bound via parameter placeholders. The
+        variable-length ``valid_ids IN (...)`` clause is generated with the
+        correct number of ``?`` tokens and bound in the parameters tuple.
+        """
+        valid_ids = list(self._get_valid_fact_ids(user_id, include_historical))
+        if not valid_ids:
+            return []
+
+        in_placeholders = ','.join('?' * len(valid_ids))
+        fts_expr = self._escape_fts_query(query)
+
         # Try FTS5 search first
         try:
-            # Clean the query for FTS5
-            clean_query = query.replace("'", "''").replace('"', '""')
-            
-            # Get valid fact IDs first
-            valid_ids = self._get_valid_fact_ids(user_id, include_historical)
-            
-            if not valid_ids:
-                return []
-                
-            # Build IN clause for valid IDs
-            valid_ids_str = ','.join(f"'{fact_id}'" for fact_id in valid_ids)
-            
-            self.cursor.execute(
-                f"""
-                SELECT fts.id, fts.content, fts.metadata 
-                FROM facts_fts fts
-                WHERE fts.facts_fts MATCH '{clean_query}' 
-                AND fts.user_id = ? 
-                AND fts.id IN ({valid_ids_str})
-                LIMIT ?
-                """,
-                (user_id, limit)
+            sql = (
+                "SELECT fts.id, fts.content, fts.metadata "
+                "FROM facts_fts fts "
+                "WHERE fts.facts_fts MATCH ? "
+                "AND fts.user_id = ? "
+                f"AND fts.id IN ({in_placeholders}) "
+                "LIMIT ?"
             )
-            
-            results = []
-            for row in self.cursor.fetchall():
-                results.append({
+            params = [fts_expr, user_id, *valid_ids, limit]
+            with self._db_lock:
+                self.cursor.execute(sql, params)
+                rows = self.cursor.fetchall()
+            return [
+                {
                     'id': row[0],
                     'content': row[1],
                     'metadata': json.loads(row[2]) if row[2] else {}
-                })
-            
-            return results
+                }
+                for row in rows
+            ]
         except Exception as e:
-            # Fallback to simple LIKE search if FTS5 fails
-            valid_ids = self._get_valid_fact_ids(user_id, include_historical)
-            
-            if not valid_ids:
-                return []
-                
-            valid_ids_str = ','.join(f"'{fact_id}'" for fact_id in valid_ids)
-            
-            self.cursor.execute(
-                f"""
-                SELECT fts.id, fts.content, fts.metadata 
-                FROM facts_fts fts
-                WHERE fts.content LIKE ? 
-                AND fts.user_id = ? 
-                AND fts.id IN ({valid_ids_str})
-                LIMIT ?
-                """,
-                (f"%{query}%", user_id, limit)
+            log.warning("FTS5 search failed, falling back to LIKE: %s", e)
+
+            # Fallback to simple LIKE search if FTS5 fails — still fully
+            # parameterised; % wildcards are concatenated inside the bound
+            # value, not the SQL string.
+            sql = (
+                "SELECT fts.id, fts.content, fts.metadata "
+                "FROM facts_fts fts "
+                "WHERE fts.content LIKE ? "
+                "AND fts.user_id = ? "
+                f"AND fts.id IN ({in_placeholders}) "
+                "LIMIT ?"
             )
-            
-            results = []
-            for row in self.cursor.fetchall():
-                results.append({
+            params = [f"%{query}%", user_id, *valid_ids, limit]
+            with self._db_lock:
+                self.cursor.execute(sql, params)
+                rows = self.cursor.fetchall()
+            return [
+                {
                     'id': row[0],
                     'content': row[1],
                     'metadata': json.loads(row[2]) if row[2] else {}
-                })
-            
-            return results
+                }
+                for row in rows
+            ]
         
     def _merge_results(self, semantic: List[Dict], exact: List[Dict], limit: int) -> List[Dict]:
         """Merge semantic and exact results, removing duplicates."""

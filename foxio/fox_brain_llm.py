@@ -15,6 +15,7 @@ Current state:
 - Hunger: {hunger}/100
 - Activity: user is currently {activity}
 - Time of day: {time_of_day}
+{memory_context}
 
 Rules:
 - Keep replies short enough — 1 or 2 sentences max. Don't ramble.
@@ -23,6 +24,7 @@ Rules:
 - Never mention being an AI or language model. You are a fox.
 - Never call the user "human" or "master" or any title.
 - Be encouraging, not condescending.
+- Use the memory context to personalize responses and remember what the user has told you.
 """
 
 class FoxLLM:
@@ -50,6 +52,7 @@ class FoxLLM:
                     hunger=int(brain_state.get("hunger", 50)),
                     activity=brain_state.get("activity_category", "unknown"),
                     time_of_day=brain_state.get("time_of_day", "daytime"),
+                    memory_context=brain_state.get("memory_context", ""),
                 )
                 log.debug("system prompt:\n%s", system_prompt)
                 response = self.client.chat.completions.create(

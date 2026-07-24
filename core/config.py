@@ -80,6 +80,10 @@ def meal_factor() -> float:
 NIGHT_START_HOUR = 22
 NIGHT_END_HOUR = 6
 
+def is_night() -> bool:
+    h = datetime.now().hour
+    return h >= NIGHT_START_HOUR or h < NIGHT_END_HOUR
+
 # ── Activity / idle (screen watcher) ──
 IDLE_AFK_SECONDS = 120.0
 IDLE_NAP_SECONDS = 300.0
@@ -101,12 +105,29 @@ BUBBLE_FADE_OUT_MS = 400
 BUBBLE_DURATION_MS = 3000
 BUBBLE_TAIL_W = 10
 BUBBLE_TAIL_H = 8
+BUBBLE_RADIUS = 6
+BUBBLE_SHADOW_COLOR = (30, 20, 10, 60)
+BUBBLE_SHADOW_OFFSET = (2, 3)
+BUBBLE_SHADOW_BLUR = 4
 BUBBLE_BG = (248, 244, 236, 240)
 BUBBLE_BORDER = (50, 30, 10)
 BUBBLE_TEXT_COLOR = (30, 20, 10)
 BUBBLE_BG_HEX = "#F8F4EC"
 BUBBLE_BORDER_HEX = "#321E0A"
 BUBBLE_TEXT_HEX = "#1E140A"
+
+# Night bubble variants
+BUBBLE_BG_NIGHT = (40, 36, 50, 230)
+BUBBLE_BORDER_NIGHT = (100, 90, 130)
+BUBBLE_TEXT_COLOR_NIGHT = (220, 215, 240)
+BUBBLE_BG_NIGHT_HEX = "#282432"
+BUBBLE_BORDER_NIGHT_HEX = "#645A82"
+BUBBLE_TEXT_NIGHT_HEX = "#DCD7F0"
+
+# ── Thinking state ──
+THINKING_DOTS_INTERVAL = 500  # ms between dot changes
+THINKING_BOUNCE_AMP = 0.04
+THINKING_BOUNCE_FREQ = 3.0
 
 # ── Behavior speech cooldowns ──
 SPEAK_COOLDOWN = 8.0
@@ -125,6 +146,41 @@ BRAIN_JUMP_VY = -400
 ROAD_HEIGHT = 8
 ROAD_TILE_PATH = "assets/road_tile.png"
 
+# ── Particles ──
+PARTICLE_MAX_COUNT = 30
+DUST_SPAWN_INTERVAL = 0.15
+DUST_LIFETIME = 0.6
+DUST_SIZE = 2
+LANDING_PUFF_COUNT = 6
+BONK_STAR_LIFETIME = 0.5
+BONK_STAR_COUNT = 3
+Zzz_SPAWN_INTERVAL = 3.0
+Zzz_LIFETIME = 2.0
+HEART_LIFETIME = 1.2
+HEART_COUNT = 3
+
+# ── Chat input ──
+CHAT_INPUT_WIDTH = 240
+CHAT_INPUT_HEIGHT = 36
+CHAT_PLACEHOLDER = "Say something..."
+CHAT_TETHER_COLOR = (50, 30, 10, 120)
+CHAT_TETHER_WIDTH = 1
+
+# ── Onboarding ──
+ONBOARDING_HINT_DURATION_MS = 4000
+ONBOARDING_FADE_IN_MS = 300
+ONBOARDING_FADE_OUT_MS = 500
+
+# ── Hover / drag ──
+HOVER_BOUNCE_AMP = 0.03
+HOVER_BOUNCE_FREQ = 2.0
+DRAG_OPACITY = 0.85
+DRAG_SHADOW_COLOR = (0, 0, 0, 40)
+
+# ── Edge feedback ──
+EDGE_SQUASH_FACTOR = 0.75
+EDGE_BOUNCE_RESTORE_MS = 200
+
 # ── Groq chat ──
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "llama-3.1-8b-instant"
@@ -136,18 +192,62 @@ CHAT_TIMEOUT_SECONDS = 8
 # ── Settings file ──
 SETTINGS_PATH = "settings.json"
 
+_TMP_SUFFIX = ".tmp"
+
 def load_settings():
-    if not os.path.exists(SETTINGS_PATH):
-        return {}
-    try:
-        with open(SETTINGS_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    """Load persisted settings with recovery after a crashed write.
+
+    Tries the primary path first; if that does not exist or parses as
+    invalid JSON, falls back to the temp-file path ``SETTINGS_PATH +
+    ".tmp"`` which may hold the last-good write when ``os.replace`` had
+    not yet swapped the new atomically-written file on crash.
+    """
+    paths = [SETTINGS_PATH, SETTINGS_PATH + _TMP_SUFFIX]
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            if path != SETTINGS_PATH:
+                try:
+                    os.replace(path, SETTINGS_PATH)
+                except OSError:
+                    pass
+            return data
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return {}
+
 
 def save_settings(data: dict):
+    """Atomically persist ``data`` as JSON.
+
+    Writes the full payload to ``SETTINGS_PATH`` + ``".tmp"`` in the same
+    directory (ensuring the same filesystem so ``os.replace`` is atomic),
+    then swaps the temp file into place.  If the process crashes mid-write
+    the original ``SETTINGS_PATH`` remains untouched, preserving the
+    previous settings.
+    """
+    if not isinstance(data, dict):
+        raise TypeError("save_settings() expects a dict, not %r" % type(data))
+    tmp_path = SETTINGS_PATH + _TMP_SUFFIX
+    directory = os.path.dirname(SETTINGS_PATH) or "."
     try:
-        with open(SETTINGS_PATH, "w") as f:
+        os.makedirs(directory, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, SETTINGS_PATH)
     except Exception:
-        pass
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass

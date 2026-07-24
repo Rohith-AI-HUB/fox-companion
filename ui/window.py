@@ -16,11 +16,13 @@ class CompanionWindow(QWidget):
             Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
         self.resize(config.WINDOW_SIZE, config.WINDOW_SIZE)
         self.dragging = False
         self.drag_offset = QPoint()
         self.click_through = False
         self._pixmap = None
+        self._hovered = False
         self._direction = 1
         self._transform_scale = 1.0
         self._transform_squash = 1.0
@@ -50,6 +52,10 @@ class CompanionWindow(QWidget):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        if self.dragging:
+            painter.setOpacity(config.DRAG_OPACITY)
+
         pw = self._pixmap.width()
         ph = self._pixmap.height()
         if pw == 0 or ph == 0:
@@ -63,9 +69,20 @@ class CompanionWindow(QWidget):
         painter.drawPixmap(-pw // 2, -ph // 2, self._pixmap)
         painter.end()
 
+    def enterEvent(self, e):
+        self._hovered = True
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hovered = False
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(e)
+
     def mousePressEvent(self, e: QMouseEvent):
         if e.button() == Qt.MouseButton.LeftButton:
             self.dragging = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.drag_offset = e.globalPosition().toPoint() - self.pos()
             self._drag_positions = [(e.globalPosition().toPoint(), self._now())]
             self._drag_times = [self._now()]
@@ -87,6 +104,7 @@ class CompanionWindow(QWidget):
                 (self._drag_positions[-1][0] - self._drag_positions[0][0]).manhattanLength() > 10
             )
             self.dragging = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
             if not dragged and self.open_chat:
                 self.open_chat()
                 return
@@ -120,6 +138,8 @@ class CompanionWindow(QWidget):
             if hasattr(self, 'physics'):
                 dir = 1 if random.random() < 0.5 else -1
                 self.physics.jump(config.DOUBLE_CLICK_JUMP_VY, dir * config.DOUBLE_CLICK_JUMP_VX)
+            if hasattr(self, 'particles') and random.random() < 0.4:
+                self.particles.spawn_heart(self.x() + self.width() // 2, self.y() + self.height() // 2)
             if hasattr(self, 'voice') and self.voice and self.bubble and random.random() < 0.6:
                 from core.dialogue import get_line
                 line = get_line("poke_reaction")
@@ -160,6 +180,28 @@ class CompanionWindow(QWidget):
 
     def contextMenuEvent(self, e):
         menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {config.BUBBLE_BG_HEX};
+                border: 2px solid {config.BUBBLE_BORDER_HEX};
+                border-radius: 4px;
+                padding: 4px;
+                color: {config.BUBBLE_TEXT_HEX};
+            }}
+            QMenu::item {{
+                padding: 6px 24px 6px 12px;
+                border-radius: 2px;
+            }}
+            QMenu::item:selected {{
+                background-color: {config.BUBBLE_BORDER_HEX};
+                color: {config.BUBBLE_BG_HEX};
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background-color: {config.BUBBLE_BORDER_HEX};
+                margin: 2px 6px;
+            }}
+        """)
         for action in ["Idle", "Walk", "Sit", "Jump", "Hit"]:
             act = QAction(action, self)
             act.triggered.connect(lambda _, a=action: self.on_action(a))

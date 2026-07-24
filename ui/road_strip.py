@@ -17,8 +17,16 @@ class RoadStrip(QWidget):
         self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
         self.tile = QPixmap(tile_path)
         self.resize(screen_width, config.ROAD_HEIGHT)
+        self.scroll_offset = 0.0
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.drawTiledPixmap(self.rect(), self.tile)
+        r = self.rect()
+        w = self.tile.width()
+        if w > 0:
+            offset = int(self.scroll_offset) % w
+            painter.drawTiledPixmap(r.adjusted(-offset, 0, -offset, 0), self.tile)
+            painter.drawTiledPixmap(r.adjusted(w - offset, 0, w - offset, 0), self.tile)
+        else:
+            painter.drawTiledPixmap(r, self.tile)
         painter.end()

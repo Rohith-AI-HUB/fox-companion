@@ -16,6 +16,9 @@ class PhysicsState:
         self.landing_bounce = 0.0
         self.squash = 1.0
         self.stretch = 1.0
+        self.edge_hit = False
+        self.just_landed = False
+        self._was_on_ground = True
 
     def set_bounds(self, left, right):
         self.left = float(left)
@@ -73,17 +76,21 @@ class PhysicsState:
 
         self.x += self.vx * dt
 
+        self.edge_hit = False
         if self.x < self.left:
             self.x = self.left
             self.vx = 0.0
-            if self.walking:
-                self.target_x = self.right
+            self.edge_hit = True
+            self.squash = config.EDGE_SQUASH_FACTOR
+            self.target_x = self.right
         elif self.x > self.right:
             self.x = self.right
             self.vx = 0.0
-            if self.walking:
-                self.target_x = self.left
+            self.edge_hit = True
+            self.squash = config.EDGE_SQUASH_FACTOR
+            self.target_x = self.left
 
+        self.just_landed = False
         if not self.on_ground:
             self.vy += config.GRAVITY * dt
             self.y += self.vy * dt
@@ -96,6 +103,7 @@ class PhysicsState:
                 if abs(self.vy) < config.BOUNCE_VELOCITY:
                     self.vy = 0.0
                     self.on_ground = True
+                    self.just_landed = True
                     self.landing_bounce = 1.0
                 self.squash = 0.85
 
