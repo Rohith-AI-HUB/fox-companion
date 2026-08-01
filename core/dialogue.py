@@ -1,11 +1,8 @@
 import random
-from datetime import datetime
-
-def _hour() -> int:
-    return datetime.now().hour
+from core import config
 
 def _get_wake_lines() -> list[str]:
-    h = _hour()
+    h = config.hour()
     if 5 <= h < 12:
         return ["Good morning!", "Morning sunshine!", "Rise and shine!"]
     elif 12 <= h < 17:

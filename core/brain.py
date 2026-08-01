@@ -80,5 +80,4 @@ class Brain:
         return "idle"
 
     def is_late(self) -> bool:
-        h = config.datetime.now().hour
-        return h >= config.NIGHT_START_HOUR or h < config.NIGHT_END_HOUR
+        return config.is_night()

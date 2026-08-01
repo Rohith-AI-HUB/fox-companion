@@ -1,12 +1,12 @@
 import os
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 import hashlib
-import logging
-from fastembed import TextEmbedding
 import chromadb
 from chromadb.config import Settings
 from groq import Groq
@@ -15,59 +15,194 @@ from core.logger import get_logger
 
 log = get_logger("memory")
 
+_MEM_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fox-mem")
+
+try:
+    from fastembed import TextEmbedding as _TE
+except Exception:  # pragma: no cover - import failures handled lazily
+    _TE = None
+
+
 class FoxBrain:
     def __init__(self, user_id: str = "default", vault_path: str = "brain/vault"):
-        # Load environment variables
         load_dotenv()
-        
+
         self.user_id = user_id
         self.vault_path = Path(vault_path)
         self.raw_path = self.vault_path / "raw"
         self.reflections_path = self.vault_path / "reflections"
         self.conflicts_path = self.vault_path / "conflicts"
-        
-        # Ensure directories exist
+
         self.raw_path.mkdir(parents=True, exist_ok=True)
         self.reflections_path.mkdir(parents=True, exist_ok=True)
         self.conflicts_path.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize Groq client for entity extraction and conflict detection
+
         groq_api_key = os.getenv("GROQ_API_KEY")
         if groq_api_key:
             self.groq_client = Groq(api_key=groq_api_key)
         else:
-            log.warning("GROQ_API_KEY not found in environment variables — memory entity extraction and contradiction detection disabled")
+            log.warning("GROQ_API_KEY not found — memory entity extraction disabled")
             self.groq_client = None
-        
-        # Initialize Mem0 with local FastEmbed
-        self._init_mem0()
-        
-        # Initialize SQLite FTS5 for keyword search
+
+        # ── Lazy FastEmbed + Chroma ──────────────────────────────────────
+        self._embedding_model = None
+        self._embedding_ready = threading.Event()
+        self._embedding_lock = threading.Lock()
+        self._embedding_init_started = False
+
+        self.chroma_client = None
+        self.collection = None
+        self.memory = None
+
+        # Defer semantic store init until after first frame rendered.
+        # Callers use start_embedding_warmup() or _ensure_embeddings().
+        # Keyword-only fallback remains fully functional at all times.
+
+        # SQLite FTS5 for exact-match keyword search and temporal validity.
+        # check_same_thread=False permits worker threads (async pipeline)
+        # to use the same connection; all writes serialise via _db_lock.
         self._init_sqlite_fts()
-        
-    def _init_mem0(self):
-        """Initialize local vector store with FastEmbed embeddings (bypassing Mem0's embedder issues)."""
-        # Initialize FastEmbed with a local model
-        self.embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-        
-        # Initialize ChromaDB directly for vector storage
+
+    # ── Lazy FastEmbed + ChromaDB initialisation ──────────────────────
+
+    def start_embedding_warmup(self) -> None:
+        """Kick off FastEmbed + Chroma init in a background worker thread.
+
+        Safe to call multiple times: the initialisation only runs once.
+        Memory operations gracefully fall back to keyword-only FTS until
+        the embeddings subsystem is ready.
+        """
+        with self._embedding_lock:
+            if self._embedding_init_started:
+                return
+            self._embedding_init_started = True
+        _MEM_WORKERS.submit(self._init_embeddings_background)
+
+    def _init_embeddings_background(self):
+        if _TE is None:
+            log.warning("fastembed not available — semantic memory disabled")
+            self._embedding_ready.set()
+            return
+        try:
+            log.info("embedding warmup: loading BAAI/bge-small-en-v1.5")
+            self._embedding_model = _TE(model_name="BAAI/bge-small-en-v1.5")
+        except Exception as e:
+            log.warning("could not load FastEmbed model: %s", e)
+            self._embedding_model = None
+            self._embedding_ready.set()
+            return
         try:
             self.chroma_client = chromadb.PersistentClient(
                 path=str(self.vault_path / "chroma_db"),
-                settings=Settings(anonymized_telemetry=False)
+                settings=Settings(anonymized_telemetry=False),
             )
             self.collection = self.chroma_client.get_or_create_collection(
                 name="fox_memory",
-                metadata={"hnsw:space": "cosine"}
+                metadata={"hnsw:space": "cosine"},
             )
-            self.memory = None  # We'll use Chroma directly instead of Mem0
-            log.info("Initialized ChromaDB with FastEmbed vector store")
+            self.memory = None
+            log.info("semantic memory ready (ChromaDB + FastEmbed)")
         except Exception as e:
-            log.warning("Could not initialize ChromaDB: %s. Falling back to non-semantic memory (keyword search only)", e)
+            log.warning("could not initialise ChromaDB: %s — keyword-only memory", e)
             self.chroma_client = None
             self.collection = None
-            self.memory = None
-        
+        finally:
+            self._embedding_ready.set()
+
+    def _ensure_embeddings(self, timeout_s: float = 5.0):
+        """Return the FastEmbed model if loaded, else wait briefly.
+
+        Returns None if the embedding model is not ready in ``timeout_s``;
+        callers should gracefully skip semantic indexing/retrieval.
+        """
+        if self._embedding_model is not None:
+            return self._embedding_model
+        if not self._embedding_init_started:
+            self.start_embedding_warmup()
+        self._embedding_ready.wait(timeout=timeout_s)
+        return self._embedding_model
+
+    # ── Async pipeline wrappers ───────────────────────────────────────
+
+    def capture_async(
+        self,
+        text: str,
+        user_id: Optional[str] = None,
+        on_done: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ):
+        """Run :meth:`capture` in a background worker thread, invoke callbacks via Qt event loop."""
+        import sys as _sys
+        from PyQt6.QtCore import QObject, pyqtSignal
+
+        class _Bridge(QObject):
+            done = pyqtSignal(list)
+            error = pyqtSignal(object)
+
+        bridge = _Bridge()
+        if on_done is not None:
+            bridge.done.connect(on_done)
+        if on_error is not None:
+            bridge.error.connect(on_error)
+
+        def _worker():
+            try:
+                result = self.capture(text, user_id=user_id)
+            except Exception as e:  # pragma: no cover - defensive
+                log.error("capture_async worker suppressed: %s", e)
+                try:
+                    bridge.error.emit(e)
+                except Exception:
+                    pass
+                return
+            try:
+                bridge.done.emit(result)
+            except Exception:
+                pass
+
+        _MEM_WORKERS.submit(_worker)
+
+    def retrieve_async(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        top_k: int = 5,
+        include_historical: bool = False,
+        on_done: Optional[Callable[[Dict[str, List[Dict[str, Any]]]], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ):
+        """Run :meth:`retrieve` in a background worker thread, marshal results back via Qt signals."""
+        from PyQt6.QtCore import QObject, pyqtSignal
+
+        class _Bridge(QObject):
+            done = pyqtSignal(dict)
+            error = pyqtSignal(object)
+
+        bridge = _Bridge()
+        if on_done is not None:
+            bridge.done.connect(on_done)
+        if on_error is not None:
+            bridge.error.connect(on_error)
+
+        def _worker():
+            try:
+                result = self.retrieve(
+                    query, user_id=user_id, top_k=top_k, include_historical=include_historical
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                log.error("retrieve_async worker suppressed: %s", e)
+                try:
+                    bridge.error.emit(e)
+                except Exception:
+                    pass
+                return
+            try:
+                bridge.done.emit(result)
+            except Exception:
+                pass
+
+        _MEM_WORKERS.submit(_worker)
+
     def _init_sqlite_fts(self):
         """Initialize SQLite FTS5 for exact-match keyword search and temporal validity.
 
@@ -204,15 +339,14 @@ Respond with only the key, nothing else."""
                 relation = self._detect_contradiction(old_fact, fact, entity_key)
                 self._apply_temporal_resolution(old_fact, fact, relation, user_id)
         
-        # Add to ChromaDB with FastEmbed if available
-        if self.collection is not None:
+        # Add to ChromaDB with FastEmbed if available (lazy-init)
+        embedder = self._ensure_embeddings(timeout_s=3.0)
+        if embedder is not None and self.collection is not None:
             try:
-                # Generate embedding using FastEmbed
-                embeddings = list(self.embedding_model.embed([conversation_text]))
+                embeddings = list(embedder.embed([conversation_text]))
                 embedding = embeddings[0] if embeddings else None
-                
+
                 if embedding is not None:
-                    # Add to ChromaDB
                     self.collection.add(
                         ids=[fact_id],
                         embeddings=[embedding.tolist()],
@@ -220,12 +354,12 @@ Respond with only the key, nothing else."""
                         metadatas=[{
                             'user_id': user_id,
                             'timestamp': current_time.isoformat(),
-                            'entity_key': entity_key
-                        }]
+                            'entity_key': entity_key,
+                        }],
                     )
                     fact['metadata']['tags'].append('vector_indexed')
             except Exception as e:
-                log.warning("Could not index fact into vector store: %s", e)
+                log.warning("could not index fact into vector store: %s", e)
         
         # Insert into SQLite with temporal validity
         self._insert_fact_with_temporal(fact, user_id, current_time)
@@ -428,33 +562,31 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
         history_keywords = ['used to', 'previously', 'formerly', 'past', 'before', 'history', 'old']
         asks_history = any(keyword in query.lower() for keyword in history_keywords)
         
-        # Semantic search via ChromaDB with FastEmbed
+        # Semantic search via ChromaDB with FastEmbed (lazy; fall-through to FTS
         semantic_results = []
-        if self.collection is not None:
+        embedder = self._ensure_embeddings(timeout_s=2.0)
+        if embedder is not None and self.collection is not None:
             try:
-                # Generate embedding for query
-                embeddings = list(self.embedding_model.embed([query]))
+                embeddings = list(embedder.embed([query]))
                 query_embedding = embeddings[0] if embeddings else None
-                
+
                 if query_embedding is not None:
-                    # Search ChromaDB
                     results = self.collection.query(
                         query_embeddings=[query_embedding.tolist()],
                         n_results=top_k,
-                        where={"user_id": user_id}
+                        where={"user_id": user_id},
                     )
-                    
-                    # Format results and filter by temporal validity
+
                     if results['ids'] and results['ids'][0]:
                         valid_ids = self._get_valid_fact_ids(user_id, include_historical or asks_history)
-                        
+
                         for i, doc_id in enumerate(results['ids'][0]):
-                            if doc_id in valid_ids:  # Only include currently valid facts
+                            if doc_id in valid_ids:
                                 semantic_results.append({
                                     'id': doc_id,
                                     'content': results['documents'][0][i],
                                     'metadata': results['metadatas'][0][i] if results['metadatas'] else {},
-                                    'score': results['distances'][0][i] if results['distances'] else None
+                                    'score': results['distances'][0][i] if results['distances'] else None,
                                 })
             except Exception as e:
                 log.warning("ChromaDB semantic search failed: %s", e)

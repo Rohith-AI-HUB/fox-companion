@@ -1,4 +1,4 @@
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from groq import Groq
 from core import config
 from core.logger import get_logger
@@ -27,50 +27,68 @@ Rules:
 - Use the memory context to personalize responses and remember what the user has told you.
 """
 
+_LLM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fox-llm")
+
+
 class FoxLLM:
     def __init__(self):
         self.client = Groq(api_key=config.GROQ_API_KEY) if config.GROQ_API_KEY else None
-        self._lock = threading.Lock()
 
     def ask(self, user_text: str, brain_state: dict, on_result=None, on_error=None):
+        """Queue an LLM request via a bounded 2-worker pool.
+
+        Two concurrent slots allow a user-initiated chat and a behavior-
+        triggered speech line to coexist without either waiting seconds
+        for the other to finish its network round trip.  Results and
+        errors are marshalled to callbacks already designed for async
+        delivery, so no coarse-grained ``threading.Lock`` is required
+        around the call body.
+        """
         if not self.client:
             if on_error:
-                on_error("no_api_key")
+                try:
+                    on_error("no_api_key")
+                except Exception:
+                    pass
             return
         log.info("ask: %s", user_text)
-        thread = threading.Thread(
-            target=self._ask_sync, args=(user_text, brain_state, on_result, on_error), daemon=True
-        )
-        thread.start()
+        _LLM_EXECUTOR.submit(self._ask_sync, user_text, brain_state, on_result, on_error)
 
     def _ask_sync(self, user_text, brain_state, on_result, on_error):
-        with self._lock:
-            try:
-                system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-                    energy=int(brain_state.get("energy", 50)),
-                    boredom=int(brain_state.get("boredom", 50)),
-                    hunger=int(brain_state.get("hunger", 50)),
-                    activity=brain_state.get("activity_category", "unknown"),
-                    time_of_day=brain_state.get("time_of_day", "daytime"),
-                    memory_context=brain_state.get("memory_context", ""),
-                )
-                log.debug("system prompt:\n%s", system_prompt)
-                response = self.client.chat.completions.create(
-                    model=config.GROQ_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_text},
-                    ],
-                    max_tokens=config.CHAT_MAX_TOKENS,
-                    temperature=config.CHAT_TEMPERATURE,
-                    timeout=config.CHAT_TIMEOUT_SECONDS,
-                )
-                text = response.choices[0].message.content.strip()
-                text = text.strip("'\"")
-                log.info("reply: %s", text)
-                if on_result:
+        # Note: each call runs on a pool worker thread.  Multiple
+        # callers may execute concurrently up to the pool size cap.
+        try:
+            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+                energy=int(brain_state.get("energy", 50)),
+                boredom=int(brain_state.get("boredom", 50)),
+                hunger=int(brain_state.get("hunger", 50)),
+                activity=brain_state.get("activity_category", "unknown"),
+                time_of_day=brain_state.get("time_of_day", "daytime"),
+                memory_context=brain_state.get("memory_context", ""),
+            )
+            log.debug("system prompt:\n%s", system_prompt)
+            response = self.client.chat.completions.create(
+                model=config.GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                max_tokens=config.CHAT_MAX_TOKENS,
+                temperature=config.CHAT_TEMPERATURE,
+                timeout=config.CHAT_TIMEOUT_SECONDS,
+            )
+            text = response.choices[0].message.content.strip()
+            text = text.strip("'\"")
+            log.info("reply: %s", text)
+            if on_result:
+                try:
                     on_result(text)
-            except Exception as e:
-                log.error("Groq call failed: %s", e)
-                if on_error:
+                except Exception:
+                    pass
+        except Exception as e:
+            log.error("Groq call failed: %s", e)
+            if on_error:
+                try:
                     on_error(str(e))
+                except Exception:
+                    pass

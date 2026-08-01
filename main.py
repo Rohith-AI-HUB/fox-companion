@@ -83,7 +83,7 @@ onboarding = OnboardingHints()
 onboarding.start(win)
 
 def get_time_of_day():
-    h = config.datetime.now().hour
+    h = config.hour()
     if h < 6: return "late night"
     if h < 12: return "morning"
     if h < 17: return "afternoon"
@@ -128,12 +128,39 @@ def open_voice_chat():
         on_error=handle_voice_error
     )
 
+_CHARS_PER_SECOND_READ = 18.0
+_BUBBLE_MIN_MS = 2500
+_BUBBLE_MAX_MS = 20000
+
+
+def _estimate_bubble_ms(text: str, tts_hint_s: float = 0.0) -> int:
+    """Bubble lifetime = max(text reading time, tts duration). Clamped to sane range."""
+    read_s = max(1.0, len(text) / _CHARS_PER_SECOND_READ)
+    total_s = max(read_s, float(tts_hint_s))
+    ms = int(total_s * 1000) + 500  # small tail buffer
+    return max(_BUBBLE_MIN_MS, min(_BUBBLE_MAX_MS, ms))
+
+
 def _deliver_reply(reply_text: str):
     pos = win.pos()
-    bubble.show_text(reply_text, pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=15000)
-    if not voice.muted:
-        voice.speak(reply_text)
-    behavior.suppress_speech_for(15)
+    tts_hint_s = voice.last_duration() if voice else 0.0
+    estimated_ms = _estimate_bubble_ms(reply_text, tts_hint_s)
+    bubble.show_text(reply_text, pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=estimated_ms)
+
+    suppress_s = min(15.0, estimated_ms / 1000.0)
+    behavior.suppress_speech_for(suppress_s)
+
+    if voice.muted:
+        return
+
+    def _on_end():
+        try:
+            bubble._hide_timer.stop()
+            QTimer.singleShot(600, bubble._fade_out)
+        except Exception:
+            pass
+
+    voice.speak(reply_text, on_end=_on_end)
 
 def handle_chat_submit(text: str):
     now = time.time()
@@ -148,52 +175,57 @@ def handle_chat_submit(text: str):
     sprites.on_finish = lambda: sprites.play("sit_idle")
     physics.stop_walk()
 
-    # Capture user input to memory
-    try:
-        fox_brain.capture(text, user_id="default")
-        log.info("Captured to memory: %s", text)
-    except Exception as e:
-        log.error("Memory capture failed: %s", e)
+    # ── Capture user input to memory (background thread, fire & forget)
+    def _capture_user_done(_facts):
+        log.info("captured user input to memory")
+    fox_brain.capture_async(text, user_id="default", on_done=_capture_user_done)
 
-    # Retrieve relevant memories
-    memory_context = ""
-    try:
-        memories = fox_brain.retrieve(text, user_id="default", top_k=3)
-        if memories['merged']:
-            memory_context = "Relevant things I remember: " + "; ".join([m.get('content', '') for m in memories['merged']])
-            log.info("Retrieved %d memories", len(memories['merged']))
-    except Exception as e:
-        log.error("Memory retrieval failed: %s", e)
-
-    brain_state = {
-        "energy": behavior.brain.energy,
-        "boredom": behavior.brain.boredom,
-        "hunger": behavior.brain.hunger,
-        "activity_category": behavior.watcher.category,
-        "time_of_day": get_time_of_day(),
-        "memory_context": memory_context,
-    }
-
+    # Show thinking indicator while retrieving memories
     pos = win.pos()
     bubble.show_thinking(pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y)
 
-    def on_result(reply_text):
-        bubble.hide_thinking()
-        # Capture fox's response to memory
-        try:
-            fox_brain.capture(reply_text, user_id="default")
-            log.info("Captured fox response to memory: %s", reply_text)
-        except Exception as e:
-            log.error("Memory capture of response failed: %s", e)
-        _pending_replies.append(reply_text)
+    # ── Retrieve relevant memories OFF main thread, then ask LLM ──
+    def _on_retrieved(memories):
+        memory_context = ""
+        if memories and memories.get('merged'):
+            memory_context = "Relevant things I remember: " + "; ".join(
+                [m.get('content', '') for m in memories['merged']]
+            )
+            log.info("retrieved %d memories", len(memories['merged']))
+        _ask_llm(memory_context)
 
-    def on_error(err):
-        if err == "no_api_key":
-            _pending_replies.append("I can't think right now... no API key set!")
-        else:
-            _pending_replies.append("Hmm, brain freeze. Try again?")
+    def _on_retrieve_err(err):
+        log.error("memory retrieval async failed: %s", err)
+        _ask_llm("")
 
-    fox_llm.ask(text, brain_state, on_result=on_result, on_error=on_error)
+    def _ask_llm(memory_context):
+        brain_state = {
+            "energy": behavior.brain.energy,
+            "boredom": behavior.brain.boredom,
+            "hunger": behavior.brain.hunger,
+            "activity_category": behavior.watcher.category,
+            "time_of_day": get_time_of_day(),
+            "memory_context": memory_context,
+        }
+
+        def on_result(reply_text):
+            bubble.hide_thinking()
+            # Capture fox response in background (fire & forget)
+            fox_brain.capture_async(reply_text, user_id="default",
+                on_done=lambda _fs: log.info("captured fox response to memory"))
+            _pending_replies.append(reply_text)
+
+        def on_error(err):
+            bubble.hide_thinking()
+            if err == "no_api_key":
+                _pending_replies.append("I can't think right now... no API key set!")
+            else:
+                _pending_replies.append("Hmm, brain freeze. Try again?")
+
+        fox_llm.ask(text, brain_state, on_result=on_result, on_error=on_error)
+
+    fox_brain.retrieve_async(text, user_id="default", top_k=3,
+        on_done=_on_retrieved, on_error=_on_retrieve_err)
 
 def handle_voice_result(text: str):
     """Handle transcribed voice input."""
@@ -234,28 +266,32 @@ win.open_chat = open_chat_input
 
 def on_wake_detected():
     log.info("wake!")
-    # Capture wake word event to memory
-    try:
-        fox_brain.capture("User said 'Hey Fox' to get my attention", user_id="default")
-        log.info("Captured wake word event to memory")
-    except Exception as e:
-        log.error("Memory capture of wake event failed: %s", e)
-    
+    # Capture wake word event to memory (fire & forget, background thread)
+    fox_brain.capture_async(
+        "User said 'Hey Fox' to get my attention",
+        user_id="default",
+        on_done=lambda _: log.info("captured wake word event to memory"),
+    )
+
     pos = win.pos()
     bubble.show_text("Yes?", pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=3000)
     behavior.suppress_speech_for(10)
     sprites.play("jump", loop=False)
     sprites.on_finish = lambda: sprites.play("idle")
-    
+
     # Initialize microphone if not already done
     if not voice_input.microphone:
         voice_input.initialize_microphone()
-    
+
     # Open voice chat after short delay
     QTimer.singleShot(1500, open_voice_chat)
 
 wake_listener = WakeListener(on_wake=on_wake_detected)
 wake_listener.start()
+
+# Kick off FastEmbed + Chroma warmup on a background thread AFTER first frame
+# so startup latency isn't eaten by model downloads/loading.
+QTimer.singleShot(250, fox_brain.start_embedding_warmup)
 
 QTimer.singleShot(1000, lambda: (
     bubble.show_text(get_line("wake"), win.x() + win.width() // 2, win.y() + config.MOUTH_Y),

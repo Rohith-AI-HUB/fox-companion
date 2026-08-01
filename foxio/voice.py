@@ -1,5 +1,7 @@
-import asyncio, sys, tempfile, os, threading, time
+import asyncio, sys, tempfile, os, threading, time, hashlib, shutil
+from pathlib import Path
 import miniaudio
+import edge_tts
 from edge_tts.exceptions import NoAudioReceived
 from core import config
 from core.logger import get_logger
@@ -12,6 +14,68 @@ else:
     _winsound = None
 
 _POLL_INTERVAL_S = 0.05
+
+_CACHE_DIR = os.path.join(tempfile.gettempdir(), "fox-tts-cache")
+_CACHE_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+_CACHE_MAX_AGE_S = 7 * 24 * 60 * 60   # 7 days
+
+
+def _cache_key(text: str) -> str:
+    payload = f"{text}|{config.VOICE_NAME}|{config.VOICE_RATE}|{config.VOICE_PITCH}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_path(key: str) -> str:
+    return os.path.join(_CACHE_DIR, key + ".wav")
+
+
+def _ensure_cache_dir():
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+
+def _evict_cache_if_needed():
+    """LRU eviction: keep total size under the cap; drop aged entries first."""
+    try:
+        _ensure_cache_dir()
+        entries = []
+        total = 0
+        now = time.time()
+        for name in os.listdir(_CACHE_DIR):
+            if not name.endswith(".wav"):
+                continue
+            p = os.path.join(_CACHE_DIR, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            age = now - st.st_mtime
+            size = st.st_size
+            total += size
+            entries.append((age, size, p))
+        aged_cutoff = now - _CACHE_MAX_AGE_S
+        aged = [p for age, size, p in entries if os.path.getmtime(p) < aged_cutoff]
+        for p in aged:
+            try:
+                total -= os.path.getsize(p)
+                os.remove(p)
+            except OSError:
+                pass
+        if total <= _CACHE_MAX_BYTES:
+            return
+        entries.sort(key=lambda x: x[0], reverse=True)
+        for age, size, p in entries:
+            if total <= _CACHE_MAX_BYTES:
+                break
+            try:
+                total -= size
+                os.remove(p)
+            except OSError:
+                pass
+    except OSError as e:
+        log.debug("cache eviction skipped: %s", e)
 
 
 class VoiceEngine:
@@ -32,6 +96,12 @@ class VoiceEngine:
         self._stop_event = threading.Event()
         self._shutting_down = False
         self._sequence = 0
+        self._last_duration = 0.0
+        _ensure_cache_dir()
+        try:
+            _evict_cache_if_needed()
+        except Exception:
+            pass
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -64,11 +134,13 @@ class VoiceEngine:
     def is_speaking(self) -> bool:
         return self._speaking
 
+    def last_duration(self) -> float:
+        """Duration in seconds of the most recently completed (or started) utterance."""
+        return self._last_duration
+
     # ── Internal ──────────────────────────────────────────────────────
 
     def _run(self, text, on_start, on_end, seq):
-        # Only one utterance synthesizes at a time, but after releasing the
-        # lock a newer call may arrive — we check ``seq`` before signalling.
         with self._lock:
             self._speaking = True
             self._stop_event.clear()
@@ -76,33 +148,54 @@ class VoiceEngine:
                 on_start(text)
 
         tmp_mp3 = None
-        tmp_wav = None
+        managed_wav = None
+        is_cached_hit = False
         try:
-            fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-            synthesized_path = self._synthesize_with_retry(text, tmp_mp3)
-            if synthesized_path is None or self._stop_event.is_set():
-                return
+            key = _cache_key(text)
+            cached = _cache_path(key)
+            if os.path.exists(cached):
+                is_cached_hit = True
+                managed_wav = cached
+                log.debug("tts cache hit for: %s", text[:40])
+            else:
+                fd, tmp_mp3 = tempfile.mkstemp(suffix=".mp3")
+                os.close(fd)
+                synthesized_path = self._synthesize_with_retry(text, tmp_mp3)
+                if synthesized_path is None or self._stop_event.is_set():
+                    return
+                pcm = miniaudio.decode_file(synthesized_path)
+                self._last_duration = pcm.num_frames / pcm.sample_rate
+                fd2, managed_wav = tempfile.mkstemp(suffix=".wav")
+                os.close(fd2)
+                miniaudio.wav_write_file(managed_wav, pcm)
+                try:
+                    _ensure_cache_dir()
+                    shutil.copyfile(managed_wav, cached)
+                    _evict_cache_if_needed()
+                except Exception as e:
+                    log.debug("tts cache write skipped: %s", e)
 
-            pcm = miniaudio.decode_file(synthesized_path)
-            dur = pcm.num_frames / pcm.sample_rate
-
-            fd2, tmp_wav = tempfile.mkstemp(suffix=".wav")
-            os.close(fd2)
-            miniaudio.wav_write_file(tmp_wav, pcm)
             if self._stop_event.is_set():
                 return
 
-            self._play_wav_block(tmp_wav, dur)
+            if is_cached_hit:
+                pcm = miniaudio.decode_file(managed_wav)
+                self._last_duration = pcm.num_frames / pcm.sample_rate
+
+            self._play_wav_block(managed_wav, self._last_duration)
         except Exception as e:
             log.debug("voice _run suppressed error: %s", e)
         finally:
-            for path in (tmp_mp3, tmp_wav):
-                if path and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except (PermissionError, OSError):
-                        pass
+            if not is_cached_hit and managed_wav and os.path.exists(managed_wav):
+                try:
+                    os.remove(managed_wav)
+                except (PermissionError, OSError):
+                    pass
+            if tmp_mp3 and os.path.exists(tmp_mp3):
+                try:
+                    os.remove(tmp_mp3)
+                except (PermissionError, OSError):
+                    pass
             with self._lock:
                 if self._sequence == seq:
                     self._speaking = False
@@ -137,9 +230,7 @@ class VoiceEngine:
                 _winsound.PlaySound(wav_path, _winsound.SND_ASYNC)
             except Exception:
                 pass
-        # Wait for the declared duration OR until stop event or shorter audio
         self._sleep_interruptible(dur)
-        # Ensure sound stops when interrupted or done
         if _winsound is not None:
             try:
                 _winsound.PlaySound(None, _winsound.SND_PURGE)
@@ -147,7 +238,6 @@ class VoiceEngine:
                 pass
 
     def _sleep_interruptible(self, seconds: float):
-        """Sleep ``seconds``, returning immediately after stop is requested."""
         remaining = float(seconds)
         while remaining > 0 and not self._stop_event.is_set():
             chunk = min(_POLL_INTERVAL_S, remaining)

@@ -38,6 +38,12 @@ class CompanionWindow(QWidget):
         self._direction = direction
         self.update()
 
+    def set_frame_pixmap(self, pixmap: QPixmap, direction: int = 1):
+        """Assign a pre-loaded QPixmap (avoids disk I/O during animation)."""
+        self._pixmap = pixmap
+        self._direction = direction
+        self.update()
+
     def set_sprites(self, sprites):
         self.sprites = sprites
 

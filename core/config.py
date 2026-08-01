@@ -1,10 +1,19 @@
 import os
 import json
 from datetime import datetime
-datetime = datetime  # expose as module attribute for config.datetime
 
 from dotenv import load_dotenv
 load_dotenv()
+
+
+def now() -> datetime:
+    """Return the current local datetime (single authoritative source)."""
+    return datetime.now()
+
+
+def hour() -> int:
+    """Return the current hour (0-23). Convenience wrapper around now()."""
+    return now().hour
 
 # ── Physics ──
 WALK_ACCEL = 800.0
@@ -68,11 +77,11 @@ MEAL_HOURS = [
 ]
 
 def meal_factor() -> float:
-    now = datetime.now()
+    n = now()
     for sh, sm, eh, em in MEAL_HOURS:
-        start = now.replace(hour=sh, minute=sm, second=0)
-        end = now.replace(hour=eh, minute=em, second=0)
-        if start <= now <= end:
+        start = n.replace(hour=sh, minute=sm, second=0)
+        end = n.replace(hour=eh, minute=em, second=0)
+        if start <= n <= end:
             return 1.5
     return 0.5
 
@@ -81,7 +90,7 @@ NIGHT_START_HOUR = 22
 NIGHT_END_HOUR = 6
 
 def is_night() -> bool:
-    h = datetime.now().hour
+    h = hour()
     return h >= NIGHT_START_HOUR or h < NIGHT_END_HOUR
 
 # ── Activity / idle (screen watcher) ──
