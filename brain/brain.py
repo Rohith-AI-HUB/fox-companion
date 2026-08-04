@@ -7,20 +7,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 import hashlib
-import chromadb
-from chromadb.config import Settings
-from groq import Groq
+import numpy as np
 from dotenv import load_dotenv
 from core.logger import get_logger
 
 log = get_logger("memory")
 
 _MEM_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fox-mem")
-
-try:
-    from fastembed import TextEmbedding as _TE
-except Exception:  # pragma: no cover - import failures handled lazily
-    _TE = None
 
 
 class FoxBrain:
@@ -30,29 +23,23 @@ class FoxBrain:
         self.user_id = user_id
         self.vault_path = Path(vault_path)
         self.raw_path = self.vault_path / "raw"
-        self.reflections_path = self.vault_path / "reflections"
         self.conflicts_path = self.vault_path / "conflicts"
 
         self.raw_path.mkdir(parents=True, exist_ok=True)
-        self.reflections_path.mkdir(parents=True, exist_ok=True)
         self.conflicts_path.mkdir(parents=True, exist_ok=True)
 
-        groq_api_key = os.getenv("GROQ_API_KEY")
-        if groq_api_key:
-            self.groq_client = Groq(api_key=groq_api_key)
-        else:
+        self._groq_key = os.getenv("GROQ_API_KEY")
+        self._groq_client_obj = None
+        if not self._groq_key:
             log.warning("GROQ_API_KEY not found — memory entity extraction disabled")
-            self.groq_client = None
 
-        # ── Lazy FastEmbed + Chroma ──────────────────────────────────────
+        # ── Lazy FastEmbed ─────────────────────────────────────────────
+        # Embeddings are stored as BLOBs in the SQLite facts table and
+        # recalled with numpy cosine similarity. No separate vector DB.
         self._embedding_model = None
         self._embedding_ready = threading.Event()
         self._embedding_lock = threading.Lock()
         self._embedding_init_started = False
-
-        self.chroma_client = None
-        self.collection = None
-        self.memory = None
 
         # Defer semantic store init until after first frame rendered.
         # Callers use start_embedding_warmup() or _ensure_embeddings().
@@ -79,8 +66,10 @@ class FoxBrain:
         _MEM_WORKERS.submit(self._init_embeddings_background)
 
     def _init_embeddings_background(self):
-        if _TE is None:
-            log.warning("fastembed not available — semantic memory disabled")
+        try:
+            from fastembed import TextEmbedding as _TE
+        except Exception as e:
+            log.warning("fastembed not available — semantic memory disabled: %s", e)
             self._embedding_ready.set()
             return
         try:
@@ -91,21 +80,14 @@ class FoxBrain:
             self._embedding_model = None
             self._embedding_ready.set()
             return
+        # Embeddings live in SQLite; backfill any facts captured before the
+        # embedding column existed so semantic recall covers everything.
         try:
-            self.chroma_client = chromadb.PersistentClient(
-                path=str(self.vault_path / "chroma_db"),
-                settings=Settings(anonymized_telemetry=False),
-            )
-            self.collection = self.chroma_client.get_or_create_collection(
-                name="fox_memory",
-                metadata={"hnsw:space": "cosine"},
-            )
-            self.memory = None
-            log.info("semantic memory ready (ChromaDB + FastEmbed)")
+            self._ensure_embedding_column()
+            self._backfill_embeddings()
+            log.info("semantic memory ready (SQLite + numpy)")
         except Exception as e:
-            log.warning("could not initialise ChromaDB: %s — keyword-only memory", e)
-            self.chroma_client = None
-            self.collection = None
+            log.warning("could not backfill embeddings: %s — keyword-only memory", e)
         finally:
             self._embedding_ready.set()
 
@@ -231,7 +213,8 @@ class FoxBrain:
                     valid_from TIMESTAMP NOT NULL,
                     valid_to TIMESTAMP NULL,
                     superseded_by TEXT NULL,
-                    created_at TIMESTAMP NOT NULL
+                    created_at TIMESTAMP NOT NULL,
+                    embedding BLOB
                 )
             """)
 
@@ -253,7 +236,61 @@ class FoxBrain:
             """)
 
             self.conn.commit()
-        
+
+        # Existing databases predate the embedding column; add it now so
+        # semantic recall (and INSERTs) work immediately.
+        self._ensure_embedding_column()
+
+    def _ensure_embedding_column(self):
+        """Add the ``embedding`` BLOB column to ``facts`` if missing."""
+        with self._db_lock:
+            cols = [r["name"] for r in self.cursor.execute("PRAGMA table_info(facts)").fetchall()]
+            if "embedding" not in cols:
+                self.cursor.execute("ALTER TABLE facts ADD COLUMN embedding BLOB")
+                self.conn.commit()
+                log.info("added 'embedding' column to facts table")
+
+    def _embed_text(self, text: str, timeout_s: float = 3.0):
+        """Return a float32 numpy vector for ``text``, or None if not ready.
+
+        Blocks briefly for the lazy FastEmbed warmup, matching the previous
+        ChromaDB timeout behaviour.
+        """
+        embedder = self._ensure_embeddings(timeout_s=timeout_s)
+        if embedder is None:
+            return None
+        try:
+            embs = list(embedder.embed([text]))
+            if not embs or embs[0] is None:
+                return None
+            return np.asarray(embs[0], dtype=np.float32)
+        except Exception as e:
+            log.warning("embedding failed: %s", e)
+            return None
+
+    def _backfill_embeddings(self):
+        """Embed every stored fact that has no embedding yet."""
+        embedder = self._embedding_model
+        if embedder is None:
+            return
+        with self._db_lock:
+            self.cursor.execute("SELECT id, content FROM facts WHERE embedding IS NULL")
+            rows = self.cursor.fetchall()
+        if not rows:
+            return
+        for row in rows:
+            try:
+                embs = list(embedder.embed([row["content"]]))
+                if embs and embs[0] is not None:
+                    blob = np.asarray(embs[0], dtype=np.float32).tobytes()
+                    with self._db_lock:
+                        self.cursor.execute(
+                            "UPDATE facts SET embedding = ? WHERE id = ?", (blob, row["id"])
+                        )
+                        self.conn.commit()
+            except Exception as e:
+                log.warning("backfill embedding failed for %s: %s", row["id"], e)
+
     def _generate_slug(self, text: str) -> str:
         """Generate URL-friendly slug from text."""
         # Simple slug generation
@@ -266,6 +303,14 @@ class FoxBrain:
         """Generate consistent ID for a fact."""
         content = fact.get('content', '')
         return hashlib.md5(content.encode()).hexdigest()[:12]
+
+    @property
+    def groq_client(self):
+        """Lazily import modern Groq and create the client on first use."""
+        if self._groq_client_obj is None and self._groq_key:
+            from groq import Groq
+            self._groq_client_obj = Groq(api_key=self._groq_key)
+        return self._groq_client_obj
     
     def _extract_entity_key(self, fact_text: str) -> str:
         """Extract a normalized entity key using Groq."""
@@ -339,30 +384,15 @@ Respond with only the key, nothing else."""
                 relation = self._detect_contradiction(old_fact, fact, entity_key)
                 self._apply_temporal_resolution(old_fact, fact, relation, user_id)
         
-        # Add to ChromaDB with FastEmbed if available (lazy-init)
-        embedder = self._ensure_embeddings(timeout_s=3.0)
-        if embedder is not None and self.collection is not None:
-            try:
-                embeddings = list(embedder.embed([conversation_text]))
-                embedding = embeddings[0] if embeddings else None
+        # Embed for semantic recall (stored directly in SQLite as a BLOB)
+        embedding_vec = self._embed_text(conversation_text)
+        embedding_bytes = None
+        if embedding_vec is not None:
+            embedding_bytes = embedding_vec.tobytes()
+            fact['metadata']['tags'].append('vector_indexed')
 
-                if embedding is not None:
-                    self.collection.add(
-                        ids=[fact_id],
-                        embeddings=[embedding.tolist()],
-                        documents=[conversation_text],
-                        metadatas=[{
-                            'user_id': user_id,
-                            'timestamp': current_time.isoformat(),
-                            'entity_key': entity_key,
-                        }],
-                    )
-                    fact['metadata']['tags'].append('vector_indexed')
-            except Exception as e:
-                log.warning("could not index fact into vector store: %s", e)
-        
         # Insert into SQLite with temporal validity
-        self._insert_fact_with_temporal(fact, user_id, current_time)
+        self._insert_fact_with_temporal(fact, user_id, current_time, embedding_bytes)
         
         # Mirror to markdown
         self._mirror_to_markdown(fact, user_id)
@@ -480,13 +510,13 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
                 self.conn.commit()
             self._log_conflict(old_fact, new_fact, relation, user_id)
 
-    def _insert_fact_with_temporal(self, fact: Dict[str, Any], user_id: str, current_time: datetime):
+    def _insert_fact_with_temporal(self, fact: Dict[str, Any], user_id: str, current_time: datetime, embedding_bytes: Optional[bytes] = None):
         """Insert fact into SQLite with temporal validity fields."""
         with self._db_lock:
             self.cursor.execute(
                 """
-                INSERT INTO facts (id, content, metadata, user_id, entity_key, valid_from, valid_to, superseded_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                INSERT INTO facts (id, content, metadata, user_id, entity_key, valid_from, valid_to, superseded_by, created_at, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                 """,
                 (
                     fact['id'],
@@ -495,7 +525,8 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
                     user_id,
                     fact.get('entity_key', 'user.unknown'),
                     current_time.isoformat(),
-                    current_time.isoformat()
+                    current_time.isoformat(),
+                    embedding_bytes
                 )
             )
             self.conn.commit()
@@ -544,7 +575,8 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
         
     def retrieve(self, query: str, user_id: Optional[str] = None, top_k: int = 5, include_historical: bool = False) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Hybrid retrieval: ChromaDB vector search + SQLite FTS exact-match with temporal filtering.
+        Hybrid retrieval: SQLite numpy-embedding search + SQLite FTS exact-match
+        with temporal filtering.
         
         Args:
             query: Search query
@@ -562,35 +594,11 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
         history_keywords = ['used to', 'previously', 'formerly', 'past', 'before', 'history', 'old']
         asks_history = any(keyword in query.lower() for keyword in history_keywords)
         
-        # Semantic search via ChromaDB with FastEmbed (lazy; fall-through to FTS
-        semantic_results = []
-        embedder = self._ensure_embeddings(timeout_s=2.0)
-        if embedder is not None and self.collection is not None:
-            try:
-                embeddings = list(embedder.embed([query]))
-                query_embedding = embeddings[0] if embeddings else None
-
-                if query_embedding is not None:
-                    results = self.collection.query(
-                        query_embeddings=[query_embedding.tolist()],
-                        n_results=top_k,
-                        where={"user_id": user_id},
-                    )
-
-                    if results['ids'] and results['ids'][0]:
-                        valid_ids = self._get_valid_fact_ids(user_id, include_historical or asks_history)
-
-                        for i, doc_id in enumerate(results['ids'][0]):
-                            if doc_id in valid_ids:
-                                semantic_results.append({
-                                    'id': doc_id,
-                                    'content': results['documents'][0][i],
-                                    'metadata': results['metadatas'][0][i] if results['metadatas'] else {},
-                                    'score': results['distances'][0][i] if results['distances'] else None,
-                                })
-            except Exception as e:
-                log.warning("ChromaDB semantic search failed: %s", e)
-                semantic_results = []
+        # Semantic search via SQLite-stored embeddings + numpy cosine
+        # (lazy; falls through to FTS if embeddings are unavailable).
+        semantic_results = self._semantic_search(
+            query, user_id, top_k, include_historical or asks_history
+        )
         
         # Exact-match search via SQLite FTS with temporal filtering
         exact_results = self._fts_search(query, user_id, top_k, include_historical or asks_history)
@@ -604,6 +612,65 @@ Respond in JSON: {{"relation": "contradiction|update|unrelated", "reasoning": "<
             'merged': merged_results
         }
     
+    def _semantic_search(self, query: str, user_id: str, top_k: int, include_historical: bool = False) -> List[Dict[str, Any]]:
+        """Rank stored facts by numpy-cosine similarity to ``query``.
+
+        Facts are stored with their FastEmbed vectors as BLOBs in the SQLite
+        ``facts`` table. For this personal memory scale (hundreds of facts)
+        a brute-force, fully-normalised dot product over a subset of rows is
+        effectively instant and needs no ANN index. Rows without an embedding
+        are skipped — the FTS exact-match path still covers them.
+        """
+        embedder = self._ensure_embeddings(timeout_s=2.0)
+        if embedder is None:
+            return []
+        try:
+            q_embs = list(embedder.embed([query]))
+            if not q_embs or q_embs[0] is None:
+                return []
+            qvec = np.asarray(q_embs[0], dtype=np.float32)
+            qn = qvec / (float(np.linalg.norm(qvec)) or 1.0)
+
+            if include_historical:
+                where_sql = "user_id = ? AND embedding IS NOT NULL"
+            else:
+                where_sql = "user_id = ? AND valid_to IS NULL AND embedding IS NOT NULL"
+            with self._db_lock:
+                self.cursor.execute(
+                    f"SELECT id, content, metadata, embedding FROM facts WHERE {where_sql}",
+                    (user_id,),
+                )
+                rows = self.cursor.fetchall()
+
+            ids, docs, metas, vecs = [], [], [], []
+            for r in rows:
+                blob = r["embedding"]
+                if not blob:
+                    continue
+                ids.append(r["id"])
+                docs.append(r["content"])
+                metas.append(json.loads(r["metadata"]) if r["metadata"] else {})
+                vecs.append(np.frombuffer(blob, dtype=np.float32))
+
+            if not vecs:
+                return []
+            X = np.stack(vecs).astype(np.float32)
+            Xn = X / np.linalg.norm(X, axis=1, keepdims=True)
+            scores = Xn @ qn
+            order = np.argsort(-scores)[:top_k]
+            return [
+                {
+                    "id": ids[i],
+                    "content": docs[i],
+                    "metadata": metas[i],
+                    "score": float(scores[i]),
+                }
+                for i in order
+            ]
+        except Exception as e:
+            log.warning("semantic search failed: %s", e)
+            return []
+
     def _get_valid_fact_ids(self, user_id: str, include_historical: bool = False) -> set:
         """Get set of valid fact IDs based on temporal validity."""
         with self._db_lock:

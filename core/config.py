@@ -104,6 +104,12 @@ VOICE_NAME = "en-IN-NeerjaNeural"
 VOICE_RATE = "+10%"
 VOICE_PITCH = "+15Hz"
 
+# ── Wake word ──
+# Trigger score threshold for 'Hey Fox' / 'Fox' detection. Can be overridden
+# per-install via the "wake_threshold" key in settings.json (higher = fewer
+# false positives, lower = more sensitive).
+WAKE_THRESHOLD_DEFAULT = 0.5
+
 # ── Speech bubble ──
 BUBBLE_PADDING = 14
 BUBBLE_WRAP_WIDTH = 200
@@ -197,6 +203,20 @@ CHAT_MAX_TOKENS = 60
 CHAT_TEMPERATURE = 0.9
 CHAT_COOLDOWN = 3.0
 CHAT_TIMEOUT_SECONDS = 8
+
+# ── Screen reading (fox "watches" the user's display) ──
+SCREEN_READ_INTERVAL_S = 5.0       # capture cadence (every 5 s)
+SCREEN_POLL_COARSE = (24, 14)      # downscale grid used for change detection
+SCREEN_SIG_THRESHOLD = 640         # min abs-diff over the coarse grid to count as "changed"
+SCREEN_VISION_MIN_INTERVAL_S = 10.0  # min seconds between vision API calls
+SCREEN_SIMILAR_THRESHOLD = 0.82    # skip memory write if summary is ~this similar to last
+SCREEN_VISION_MODEL = "llama-3.2-11b-vision-preview"
+SCREEN_VISION_MAX_TOKENS = 40
+SCREEN_SOURCE_LABEL = "I noticed on your screen"
+# Fallback brain for screenshots when Groq is unavailable/fails.
+# Uses OpenAI's vision API (the models that power ChatGPT) if OPENAI_API_KEY is set.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+SCREEN_OPENAI_VISION_MODEL = "gpt-4o-mini"
 
 # ── Settings file ──
 SETTINGS_PATH = "settings.json"

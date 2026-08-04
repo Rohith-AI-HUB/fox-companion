@@ -1,8 +1,5 @@
 import asyncio, sys, tempfile, os, threading, time, hashlib, shutil
 from pathlib import Path
-import miniaudio
-import edge_tts
-from edge_tts.exceptions import NoAudioReceived
 from core import config
 from core.logger import get_logger
 
@@ -151,6 +148,7 @@ class VoiceEngine:
         managed_wav = None
         is_cached_hit = False
         try:
+            import miniaudio
             key = _cache_key(text)
             cached = _cache_path(key)
             if os.path.exists(cached):
@@ -206,6 +204,7 @@ class VoiceEngine:
                     pass
 
     def _synthesize_with_retry(self, text: str, out_path: str):
+        from edge_tts.exceptions import NoAudioReceived
         for attempt in range(2):
             if self._stop_event.is_set():
                 return None
@@ -245,5 +244,6 @@ class VoiceEngine:
             remaining -= chunk
 
     async def _synthesize(self, text: str, path: str):
+        import edge_tts
         c = edge_tts.Communicate(text, config.VOICE_NAME, rate=config.VOICE_RATE, pitch=config.VOICE_PITCH)
         await c.save(path)

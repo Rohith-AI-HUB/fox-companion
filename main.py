@@ -26,6 +26,7 @@ from ui.onboarding import OnboardingHints
 from foxio.fox_brain_llm import FoxLLM
 from foxio.wake_listener import WakeListener
 from foxio.voice_input import VoiceInput
+from foxio.screen_reader import ScreenReader
 from brain import FoxBrain
 
 _pending_replies = collections.deque()
@@ -64,6 +65,7 @@ chat_input = ChatInput()
 fox_llm = FoxLLM()
 fox_brain = FoxBrain(user_id="default", vault_path="brain/vault")
 voice_input = VoiceInput()
+screen_reader = ScreenReader(fox_brain)
 last_chat_time = [0.0]
 voice_mode_enabled = settings.get("voice_mode", True)  # Can be toggled via settings
 
@@ -96,6 +98,29 @@ def update_night_mode():
 
 update_night_mode()
 
+
+def _fox_mouth_pos(x: int, y: int):
+    """Absolute screen coordinates of the fox's mouth (speech-bubble anchor)."""
+    return (x + win.width() // 2, y + config.MOUTH_Y)
+
+
+def _fox_sit_and_hush(seconds: float = 10.0):
+    """Sit into idle, stop walking, and quiet chatter for a beat."""
+    behavior.suppress_speech_for(seconds)
+    sprites.play("sit", loop=False)
+    sprites.on_finish = lambda: sprites.play("sit_idle")
+    physics.stop_walk()
+
+
+def _persist_settings(muted=None, click_through=None, voice_mode=None):
+    """Persist current settings, applying any overrides given."""
+    config.save_settings({
+        "muted": voice.muted if muted is None else muted,
+        "click_through": win.click_through if click_through is None else click_through,
+        "voice_mode": voice_mode_enabled if voice_mode is None else voice_mode,
+    })
+
+
 def open_chat_input():
     if voice_mode_enabled:
         open_voice_chat()
@@ -105,21 +130,15 @@ def open_chat_input():
 def open_text_chat():
     pos = win.pos()
     chat_input.open_at(pos.x() - 20, pos.y() - 40)
-    behavior.suppress_speech_for(10)
-    sprites.play("sit", loop=False)
-    sprites.on_finish = lambda: sprites.play("sit_idle")
-    physics.stop_walk()
+    _fox_sit_and_hush(10)
 
 def open_voice_chat():
     """Start voice input mode after wake word."""
-    behavior.suppress_speech_for(10)
-    sprites.play("sit", loop=False)
-    sprites.on_finish = lambda: sprites.play("sit_idle")
-    physics.stop_walk()
-    
+    _fox_sit_and_hush(10)
+
     # Show listening indicator
     pos = win.pos()
-    bubble.show_text("Listening...", pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=8000)
+    bubble.show_text("Listening...", *_fox_mouth_pos(pos.x(), pos.y()), duration_ms=8000)
     
     # Start voice input
     voice_input.listen(
@@ -145,7 +164,7 @@ def _deliver_reply(reply_text: str):
     pos = win.pos()
     tts_hint_s = voice.last_duration() if voice else 0.0
     estimated_ms = _estimate_bubble_ms(reply_text, tts_hint_s)
-    bubble.show_text(reply_text, pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=estimated_ms)
+    bubble.show_text(reply_text, *_fox_mouth_pos(pos.x(), pos.y()), duration_ms=estimated_ms)
 
     suppress_s = min(15.0, estimated_ms / 1000.0)
     behavior.suppress_speech_for(suppress_s)
@@ -166,14 +185,11 @@ def handle_chat_submit(text: str):
     now = time.time()
     if now - last_chat_time[0] < config.CHAT_COOLDOWN:
         pos = win.pos()
-        bubble.show_text("One sec!", pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=1500)
+        bubble.show_text("One sec!", *_fox_mouth_pos(pos.x(), pos.y()), duration_ms=1500)
         return
     last_chat_time[0] = now
     log.info("chat submit: %s", text)
-    behavior.suppress_speech_for(15)
-    sprites.play("sit", loop=False)
-    sprites.on_finish = lambda: sprites.play("sit_idle")
-    physics.stop_walk()
+    _fox_sit_and_hush(15)
 
     # ── Capture user input to memory (background thread, fire & forget)
     def _capture_user_done(_facts):
@@ -182,7 +198,7 @@ def handle_chat_submit(text: str):
 
     # Show thinking indicator while retrieving memories
     pos = win.pos()
-    bubble.show_thinking(pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y)
+    bubble.show_thinking(*_fox_mouth_pos(pos.x(), pos.y()))
 
     # ── Retrieve relevant memories OFF main thread, then ask LLM ──
     def _on_retrieved(memories):
@@ -235,7 +251,7 @@ def handle_voice_result(text: str):
     exit_commands = ["cancel", "never mind", "forget it", "stop", "exit"]
     if any(cmd in text.lower() for cmd in exit_commands):
         pos = win.pos()
-        bubble.show_text("Okay!", pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=2000)
+        bubble.show_text("Okay!", *_fox_mouth_pos(pos.x(), pos.y()), duration_ms=2000)
         return
     
     # Process the voice input same as text input
@@ -255,7 +271,7 @@ def handle_voice_error(error: str):
     
     message = error_messages.get(error, "Sorry, try again.")
     pos = win.pos()
-    bubble.show_text(message, pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=3000)
+    bubble.show_text(message, *_fox_mouth_pos(pos.x(), pos.y()), duration_ms=3000)
     
     # Fallback to text input on error
     if error in ["microphone_error", "service_error"]:
@@ -274,7 +290,7 @@ def on_wake_detected():
     )
 
     pos = win.pos()
-    bubble.show_text("Yes?", pos.x() + win.width() // 2, pos.y() + config.MOUTH_Y, duration_ms=3000)
+    bubble.show_text("Yes?", *_fox_mouth_pos(pos.x(), pos.y()), duration_ms=3000)
     behavior.suppress_speech_for(10)
     sprites.play("jump", loop=False)
     sprites.on_finish = lambda: sprites.play("idle")
@@ -293,8 +309,15 @@ wake_listener.start()
 # so startup latency isn't eaten by model downloads/loading.
 QTimer.singleShot(250, fox_brain.start_embedding_warmup)
 
+# Screen reader: fox watches the user's display every 5 seconds and folds
+# observations into long-term memory.
+screen_timer = QTimer()
+screen_timer.setInterval(int(config.SCREEN_READ_INTERVAL_S * 1000))
+screen_timer.timeout.connect(screen_reader.poll)
+screen_timer.start()
+
 QTimer.singleShot(1000, lambda: (
-    bubble.show_text(get_line("wake"), win.x() + win.width() // 2, win.y() + config.MOUTH_Y),
+    bubble.show_text(get_line("wake"), *_fox_mouth_pos(win.x(), win.y())),
     voice.speak(get_line("wake"))
 ))
 
@@ -402,14 +425,14 @@ mute_act.setCheckable(True)
 mute_act.setChecked(voice.muted)
 def toggle_mute(checked):
     voice.muted = checked
-    config.save_settings({"muted": checked, "click_through": win.click_through, "voice_mode": voice_mode_enabled})
+    _persist_settings(muted=checked)
 mute_act.triggered.connect(toggle_mute)
 
 click_thru = QAction(f"Click-Through: {'On' if settings.get('click_through', False) else 'Off'}", tray_menu)
 def toggle_click_thru():
     on = win.toggle_click_through()
     click_thru.setText(f"Click-Through: {'On' if on else 'Off'}")
-    config.save_settings({"muted": voice.muted, "click_through": on})
+    _persist_settings(click_through=on)
 click_thru.triggered.connect(toggle_click_thru)
 
 chat_act = QAction("Talk to Fox", tray_menu)
@@ -422,7 +445,7 @@ def toggle_voice_mode(checked):
     global voice_mode_enabled
     voice_mode_enabled = checked
     voice_mode_act.setText(f"Voice Mode: {'On' if checked else 'Off'}")
-    config.save_settings({"muted": voice.muted, "click_through": win.click_through, "voice_mode": voice_mode_enabled})
+    _persist_settings(voice_mode=checked)
 voice_mode_act.triggered.connect(toggle_voice_mode)
 
 # ── Centralized shutdown ────────────────────────────────────────────
@@ -443,11 +466,7 @@ def run_shutdown():
     _SHUTDOWN_DONE = True
     log.info("shutdown: persisting settings…")
     try:
-        config.save_settings({
-            "muted": voice.muted,
-            "click_through": win.click_through,
-            "voice_mode": voice_mode_enabled,
-        })
+        _persist_settings()
     except Exception as e:
         log.error("shutdown: save_settings failed: %s", e)
 
@@ -475,6 +494,12 @@ def run_shutdown():
         log.info("shutdown: FoxBrain closed successfully")
     except Exception as e:
         log.error("shutdown: FoxBrain close failed: %s", e)
+
+    log.info("shutdown: stopping screen reader…")
+    try:
+        screen_reader.shutdown()
+    except Exception as e:
+        log.error("shutdown: screen_reader.stop failed: %s", e)
 
     # Flush + close every logger so RotatingFileHandler finishes writes
     import logging as _logging

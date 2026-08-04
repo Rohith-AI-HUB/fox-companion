@@ -39,7 +39,3 @@ settings.json
 # OS
 .DS_Store
 Thumbs.db
-
-fox_model/
-Fox-Wake-Word/
-test/

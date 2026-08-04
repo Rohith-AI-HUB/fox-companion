@@ -8,11 +8,9 @@ log = get_logger("screen_watcher")
 
 if sys.platform.startswith("win"):
     from ctypes import Structure, windll, c_uint, byref
-    import pygetwindow as gw
 else:
     log.warning("Screen watcher is not supported on this platform (only Windows is supported)")
     windll = None
-    gw = None
 
 if sys.platform.startswith("win"):
     class LASTINPUTINFO(Structure):
@@ -62,6 +60,7 @@ if sys.platform.startswith("win"):
             self._was_idle = self.idle_seconds >= config.IDLE_AFK_SECONDS
 
             try:
+                import pygetwindow as gw
                 win = gw.getActiveWindow()
                 self.active_title = win.title if win else ""
             except Exception:

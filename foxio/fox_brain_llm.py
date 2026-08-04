@@ -1,5 +1,4 @@
 from concurrent.futures import ThreadPoolExecutor
-from groq import Groq
 from core import config
 from core.logger import get_logger
 
@@ -32,7 +31,14 @@ _LLM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fox-llm")
 
 class FoxLLM:
     def __init__(self):
-        self.client = Groq(api_key=config.GROQ_API_KEY) if config.GROQ_API_KEY else None
+        self.client = None
+
+    def _ensure_client(self):
+        """Lazily import Groq and create the client on first request."""
+        if self.client is None and config.GROQ_API_KEY:
+            from groq import Groq
+            self.client = Groq(api_key=config.GROQ_API_KEY)
+        return self.client
 
     def ask(self, user_text: str, brain_state: dict, on_result=None, on_error=None):
         """Queue an LLM request via a bounded 2-worker pool.
@@ -44,7 +50,7 @@ class FoxLLM:
         delivery, so no coarse-grained ``threading.Lock`` is required
         around the call body.
         """
-        if not self.client:
+        if not self._ensure_client():
             if on_error:
                 try:
                     on_error("no_api_key")

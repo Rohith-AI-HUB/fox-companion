@@ -1,5 +1,3 @@
-import speech_recognition as sr
-import sounddevice as sd
 import numpy as np
 import threading
 import queue
@@ -17,20 +15,27 @@ CHANNELS = 1
 
 class VoiceInput:
     def __init__(self):
-        self.recognizer = sr.Recognizer()
+        self._recognizer = None
         self.microphone = True  # Flag indicating mic availability (checked at listen time)
         self.listening = False
         self._thread = None
         self._result_callback = None
 
-        # Configure recognizer
-        self.recognizer.energy_threshold = 300
-        self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.8  # seconds of silence before considering speech complete
-        self.recognizer.phrase_threshold = 0.3  # minimum seconds of speaking
+    @property
+    def recognizer(self):
+        """Lazily import SpeechRecognition and create the recognizer on first use."""
+        if self._recognizer is None:
+            import speech_recognition as sr
+            self._recognizer = sr.Recognizer()
+            self._recognizer.energy_threshold = 300
+            self._recognizer.dynamic_energy_threshold = True
+            self._recognizer.pause_threshold = 0.8  # seconds of silence before considering speech complete
+            self._recognizer.phrase_threshold = 0.3  # minimum seconds of speaking
+        return self._recognizer
 
     def initialize_microphone(self):
         """Check that a microphone (sounddevice input) is available."""
+        import sounddevice as sd
         try:
             devices = sd.query_devices()
             default_input = sd.default.device[0]
@@ -80,6 +85,8 @@ class VoiceInput:
 
     def _listen_sync(self, timeout, on_error):
         """Record audio via sounddevice, then recognise with SpeechRecognition."""
+        import sounddevice as sd
+        import speech_recognition as sr
         try:
             # Record audio with sounddevice
             log.info("Recording audio for up to %.1fs...", timeout)
@@ -144,6 +151,7 @@ class VoiceInput:
         if self.listening and self._thread:
             self.listening = False
             try:
+                import sounddevice as sd
                 sd.stop()
             except Exception:
                 pass
