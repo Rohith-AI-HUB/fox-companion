@@ -230,18 +230,23 @@ Polling-based sensory input module. Runs on a 4s timer (inside `Behavior.choose_
 
 ### `screen_reader.py` — Watches the user's display
 
-Every `SCREEN_READ_INTERVAL_S` (5 s) the fox captures the primary screen via
+Every `SCREEN_READ_INTERVAL_S` (0.4 s) the fox captures the primary screen via
 Qt (`QScreen.grabWindow`) on the GUI thread, runs **coarse change-detection**
-(a tiny downscaled grayscale grid, so the cursor and micro-flash are ignored),
-and only when the screen meaningfully changes sends the frame to a vision
-model for a one-sentence summary of the user's activity.
+(cheap signature downscaled straight from the pixmap, so the cursor and
+micro-flash are ignored and the sub-second poll stays light), and only when
+the screen meaningfully changes sends the frame to a vision model for a
+one-sentence summary of the user's activity.
 
-- **Providers:** Groq vision (`llama-3.2-11b-vision-preview`) is primary;
+- **Providers:** Groq vision (`qwen/qwen3.6-27b`) is primary;
   OpenAI vision (`gpt-4o-mini`, the models behind ChatGPT) is the fallback if
   `OPENAI_API_KEY` is set. If both are unavailable, nothing is learned.
 - **Memory:** a summary that is meaningfully different from the last is stored
   via `FoxBrain.capture_async` (previous observation is superseded), so the
   fox builds a picture of the user's daily activity.
+- **Commentary:** when a new observation appears, `ScreenCommentary`
+  (`foxio/screen_commentary.py`) shows a bubble and speaks
+  `"I see you're {summary}."` — entirely autonomous, never prompted by a user
+  question — throttled (25 s) and gated by mute/speech-suppression.
 - **Privacy:** screenshots exist only in memory — **never written to disk**.
   All vision calls run on a single background worker so the UI stays responsive.
 

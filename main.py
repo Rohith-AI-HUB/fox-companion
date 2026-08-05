@@ -1,7 +1,7 @@
 import sys, time, collections, os
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PyQt6.QtGui import QIcon, QPixmap, QAction
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
 from core import config
 from core.logger import get_logger
 
@@ -27,7 +27,9 @@ from foxio.fox_brain_llm import FoxLLM
 from foxio.wake_listener import WakeListener
 from foxio.voice_input import VoiceInput
 from foxio.screen_reader import ScreenReader
+from foxio.screen_commentary import ScreenCommentary
 from brain import FoxBrain
+from core.qt_bridge import MainThreadInvoker
 
 _pending_replies = collections.deque()
 
@@ -65,6 +67,9 @@ chat_input = ChatInput()
 fox_llm = FoxLLM()
 fox_brain = FoxBrain(user_id="default", vault_path="brain/vault")
 voice_input = VoiceInput()
+# Marshals worker-thread callbacks (voice transcription, LLM results) onto the
+# Qt main thread; created here so it lives on the GUI thread.
+_ui_invoker = MainThreadInvoker()
 screen_reader = ScreenReader(fox_brain)
 last_chat_time = [0.0]
 voice_mode_enabled = settings.get("voice_mode", True)  # Can be toggled via settings
@@ -139,12 +144,24 @@ def open_voice_chat():
     # Show listening indicator
     pos = win.pos()
     bubble.show_text("Listening...", *_fox_mouth_pos(pos.x(), pos.y()), duration_ms=8000)
-    
-    # Start voice input
+
+    # Speak an audible "Listening" cue the instant the listening state becomes
+    # active (synchronized with VoiceInput.listen). If synthesis/playback fails
+    # the listening session must keep working, so the cue is best-effort.
+    def _on_listening():
+        try:
+            voice.speak("Listening")
+        except Exception as e:
+            log.error("failed to speak listening cue: %s", e)
+
+    # Start voice input. Transcription/error callbacks run on VoiceInput's
+    # worker thread (no Qt event loop) — hop them onto the GUI thread so the
+    # whole reply pipeline (Qt bubbles, FoxBrain signal bridges) is valid.
     voice_input.listen(
         timeout=8.0,
-        on_result=handle_voice_result,
-        on_error=handle_voice_error
+        on_result=lambda text: _ui_invoker.invoke(lambda: handle_voice_result(text)),
+        on_error=lambda err: _ui_invoker.invoke(lambda: handle_voice_error(err)),
+        on_listening=_on_listening,
     )
 
 _CHARS_PER_SECOND_READ = 18.0
@@ -222,21 +239,30 @@ def handle_chat_submit(text: str):
             "activity_category": behavior.watcher.category,
             "time_of_day": get_time_of_day(),
             "memory_context": memory_context,
+            "screen_observation": screen_reader.latest_observation,
         }
 
-        def on_result(reply_text):
+        def _deliver_result(reply_text):
             bubble.hide_thinking()
             # Capture fox response in background (fire & forget)
             fox_brain.capture_async(reply_text, user_id="default",
                 on_done=lambda _fs: log.info("captured fox response to memory"))
             _pending_replies.append(reply_text)
 
-        def on_error(err):
+        def _deliver_error(err):
             bubble.hide_thinking()
             if err == "no_api_key":
                 _pending_replies.append("I can't think right now... no API key set!")
             else:
                 _pending_replies.append("Hmm, brain freeze. Try again?")
+
+        def on_result(reply_text):
+            # fox_llm.ask invokes callbacks from its pool thread; run the
+            # UI/memory work back on the Qt main thread.
+            _ui_invoker.invoke(lambda: _deliver_result(reply_text))
+
+        def on_error(err):
+            _ui_invoker.invoke(lambda: _deliver_error(err))
 
         fox_llm.ask(text, brain_state, on_result=on_result, on_error=on_error)
 
@@ -280,6 +306,24 @@ def handle_voice_error(error: str):
 chat_input.submitted.connect(handle_chat_submit)
 win.open_chat = open_chat_input
 
+# ── Proactive screen commentary ────────────────────────────────────
+# The screen reader runs on its own worker thread, so its observation
+# callback hops onto the GUI thread before touching Qt (bubble/win).
+# The fox then shows a bubble and speaks "I see you're {summary}."
+screen_commentary = ScreenCommentary(
+    bubble, voice, win, behavior,
+    mouth_pos=_fox_mouth_pos,
+    estimate_ms=_estimate_bubble_ms,
+)
+
+
+def _on_screen_observed(summary: str):
+    """Screen-reader worker-thread callback → marshal to the GUI thread."""
+    _ui_invoker.invoke(lambda: screen_commentary.speak_observation(summary))
+
+
+screen_reader.on_observe = _on_screen_observed
+
 def on_wake_detected():
     log.info("wake!")
     # Capture wake word event to memory (fire & forget, background thread)
@@ -302,7 +346,19 @@ def on_wake_detected():
     # Open voice chat after short delay
     QTimer.singleShot(1500, open_voice_chat)
 
-wake_listener = WakeListener(on_wake=on_wake_detected)
+class WakeBridge(QObject):
+    """Marshals the wake-word callback onto the Qt main thread.
+
+    WakeListener runs on a background audio thread; emitting a signal from that
+    thread is safe and Qt delivers it as a queued connection on the GUI thread,
+    where the UI/timer calls in on_wake_detected are valid.
+    """
+    wake = pyqtSignal()
+
+_wake_bridge = WakeBridge()
+_wake_bridge.wake.connect(on_wake_detected)
+
+wake_listener = WakeListener(on_wake=_wake_bridge.wake.emit)
 wake_listener.start()
 
 # Kick off FastEmbed + Chroma warmup on a background thread AFTER first frame

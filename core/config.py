@@ -108,7 +108,36 @@ VOICE_PITCH = "+15Hz"
 # Trigger score threshold for 'Hey Fox' / 'Fox' detection. Can be overridden
 # per-install via the "wake_threshold" key in settings.json (higher = fewer
 # false positives, lower = more sensitive).
-WAKE_THRESHOLD_DEFAULT = 0.5
+WAKE_THRESHOLD_DEFAULT = 0.45
+
+# ── Wake confirmation (keyword gate) ──
+# The model score alone flags casual greetings ("hey", "hi", ...) as wake
+# candidates, so a high-scoring utterance is confirmed by transcribing the
+# buffered audio and requiring the keyword below. Pure greetings that do not
+# address the fox are rejected.
+WAKE_CONFIRM_KEYWORD = "fox"
+WAKE_GREETING_STOP_WORDS = frozenset({"hey", "hi", "hello", "hii", "hai", "yo", "heya"})
+WAKE_CONFIRM_WINDOW_CHUNKS = 25     # ~2.0 s of 16 kHz audio kept for confirmation
+# If transcription is unavailable (no network/service), only a high-confidence
+# score passes so genuine wake words still work without the keyword gate.
+WAKE_CONFIRM_FALLBACK_SCORE = 0.65
+
+# ── Wake self-learning (adaptive wake word) ──
+# Alexa-style passive adaptation: during normal use the listener self-labels its
+# own triggers. Every ASR-confirmed wake is saved as a real positive clip of the
+# user's voice; every high-scoring candidate that the transcript gate rejects as
+# a non-fox utterance is saved as a negative (what must NOT wake). Once enough
+# new clips accumulate, tools/train_verifier.py is re-run in the background and
+# the freshly trained verifier is hot-reloaded without restarting the app.
+# Clips accumulate in WAKE_LEARN_DIR, which train_verifier.py already folds into
+# training automatically (same directory as tools/enroll_record.py).
+WAKE_LEARN_DIR = os.path.join("assets", "enroll")
+WAKE_LEARN_ENABLED = True            # settings.json "wake_learn_enabled" override
+WAKE_LEARN_THROTTLE_S = 10.0         # min gap between auto-saves of one label
+WAKE_LEARN_MIN_RMS = 60.0            # skip near-silent buffers (int16 RMS floor)
+WAKE_LEARN_MAX_CLIPS = 200           # hard cap per label to bound disk growth
+WAKE_LEARN_RETRAIN_AFTER = 8         # new clips before a background retrain
+WAKE_LEARN_RETRAIN_LOG = os.path.join("assets", "wake", "retrain.log")
 
 # ── Speech bubble ──
 BUBBLE_PADDING = 14
@@ -205,16 +234,18 @@ CHAT_COOLDOWN = 3.0
 CHAT_TIMEOUT_SECONDS = 8
 
 # ── Screen reading (fox "watches" the user's display) ──
-SCREEN_READ_INTERVAL_S = 5.0       # capture cadence (every 5 s)
+SCREEN_READ_INTERVAL_S = 0.4       # change-detection cadence (< 500 ms detection latency)
 SCREEN_POLL_COARSE = (24, 14)      # downscale grid used for change detection
 SCREEN_SIG_THRESHOLD = 640         # min abs-diff over the coarse grid to count as "changed"
-SCREEN_VISION_MIN_INTERVAL_S = 10.0  # min seconds between vision API calls
+SCREEN_VISION_MIN_INTERVAL_S = 60.0  # min seconds between vision API calls (conserves provider tokens)
 SCREEN_SIMILAR_THRESHOLD = 0.82    # skip memory write if summary is ~this similar to last
-SCREEN_VISION_MODEL = "llama-3.2-11b-vision-preview"
-SCREEN_VISION_MAX_TOKENS = 40
+SCREEN_VISION_MODEL = "qwen/qwen3.6-27b"
+SCREEN_VISION_MAX_TOKENS = 120
+SCREEN_VISION_RATELIMIT_COOLDOWN_S = 900.0  # pause vision for this long after a 429/rate-limit
 SCREEN_SOURCE_LABEL = "I noticed on your screen"
-# Fallback brain for screenshots when Groq is unavailable/fails.
-# Uses OpenAI's vision API (the models that power ChatGPT) if OPENAI_API_KEY is set.
+# Vision provider priority: OpenAI (paid, more generous quota) is tried first if
+# OPENAI_API_KEY is set, otherwise Groq. OpenAI is a real fallback for Groq quota
+# exhaustion on the free tier, not just the other way around.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 SCREEN_OPENAI_VISION_MODEL = "gpt-4o-mini"
 

@@ -52,7 +52,7 @@ class VoiceInput:
             self.microphone = False
             return False
 
-    def listen(self, timeout=5.0, on_result=None, on_error=None):
+    def listen(self, timeout=5.0, on_result=None, on_error=None, on_listening=None):
         """
         Listen for voice input and convert to text using sounddevice.
 
@@ -60,6 +60,10 @@ class VoiceInput:
             timeout: Maximum seconds to listen before timing out
             on_result: Callback function with transcribed text
             on_error: Callback function with error message
+            on_listening: Called synchronously the instant the listening state
+                becomes active (right after ``self.listening = True``, before the
+                recording thread starts). Use it for an immediate audio cue such
+                as speaking "Listening".
         """
         if self.listening:
             log.warning("Already listening, ignoring new request")
@@ -73,6 +77,15 @@ class VoiceInput:
 
         self.listening = True
         self._result_callback = on_result
+
+        # Synchronized activation hook: fires in the same call as the listening
+        # state flip (well inside the 100 ms window) so an audio cue starts
+        # immediately. Errors are contained so a failed cue never blocks listening.
+        if on_listening is not None:
+            try:
+                on_listening()
+            except Exception as e:
+                log.error("on_listening callback failed: %s", e)
 
         # Start listening in background thread
         self._thread = threading.Thread(

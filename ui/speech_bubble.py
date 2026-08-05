@@ -46,6 +46,7 @@ class SpeechBubble(QWidget):
             self.text,
             self.width(),
             self.height(),
+            self.devicePixelRatioF(),
             self._is_night,
             self._wrap_width,
             int(config.BUBBLE_PADDING),
@@ -55,8 +56,15 @@ class SpeechBubble(QWidget):
         )
 
     def _render_to_pixmap(self) -> QPixmap:
-        """Render bubble body + shadow + tail + text into an off-screen QPixmap."""
-        pm = QPixmap(self.size())
+        """Render bubble body + shadow + tail + text into an off-screen QPixmap.
+
+        The pixmap is created at the widget's device-pixel ratio so the cached
+        render stays sharp on HiDPI / DPI-scaled displays; a logical-resolution
+        cache would be upscaled by the compositor and blur the text.
+        """
+        dpr = max(1.0, self.devicePixelRatioF())
+        pm = QPixmap(int(self.width() * dpr), int(self.height() * dpr))
+        pm.setDevicePixelRatio(dpr)
         pm.fill(Qt.GlobalColor.transparent)
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)

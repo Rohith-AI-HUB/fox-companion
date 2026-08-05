@@ -13,6 +13,7 @@ Current state:
 - Boredom: {boredom}/100
 - Hunger: {hunger}/100
 - Activity: user is currently {activity}
+- Screen now: {screen}
 - Time of day: {time_of_day}
 {memory_context}
 
@@ -69,6 +70,7 @@ class FoxLLM:
                 boredom=int(brain_state.get("boredom", 50)),
                 hunger=int(brain_state.get("hunger", 50)),
                 activity=brain_state.get("activity_category", "unknown"),
+                screen=brain_state.get("screen_observation") or "unknown",
                 time_of_day=brain_state.get("time_of_day", "daytime"),
                 memory_context=brain_state.get("memory_context", ""),
             )
